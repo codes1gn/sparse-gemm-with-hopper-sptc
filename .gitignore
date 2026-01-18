@@ -1,1 +1,9 @@
+sparse_gemm
 sparse_gemm_random
+sparse_gemm_fp8
+sparse_gemm_tf32
+sparse_gemm_magic
+*_recheck
+*_bin
+*.o
+*.a
