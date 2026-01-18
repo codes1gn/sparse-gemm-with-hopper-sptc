@@ -1,0 +1,6 @@
+[submodule "third_party/cutlass"]
+	path = third_party/cutlass
+	url = https://github.com/NVIDIA/cutlass
+[submodule "third_party/Samoyeds-Kernel"]
+	path = third_party/Samoyeds-Kernel
+	url = https://github.com/guqiqi/Samoyeds-Kernel
