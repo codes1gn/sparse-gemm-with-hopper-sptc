@@ -6,10 +6,10 @@ FLAGS = -O3 -std=c++14
 
 # Default CUDA device id (can be overridden on the make command line)
 # Example: `make CUDA_ID=0 run-foo` or `make CUDA_ID=0 RUN_BIN=foo run`
-CUDA_ID ?= 1
+CUDA_ID ?= 0
 
 # Default binary to run with `make run` (can be overridden)
-RUN_BIN ?= mma_sp_m16n8k32_fp32fp16
+KERNEL ?= mma_sp_m16n8k32_fp32fp16
 
 # Discover only mma_sp_* CUDA sources so each kernel gets its own binary
 # FP8 sparse MMA is not supported by the PTX ISA today; exclude by default.
@@ -24,7 +24,7 @@ endif
 BINS := $(SRCS:.cu=)
 
 # Map numeric RUN_BIN to binary name (1=first, 2=second, etc.)
-BIN_TO_RUN := $(strip $(if $(filter $(RUN_BIN),$(BINS)), $(RUN_BIN), $(word $(RUN_BIN),$(BINS))))
+BIN_TO_RUN := $(strip $(if $(filter 1 2, $(KERNEL)), $(word $(KERNEL), $(BINS)), $(KERNEL)))
 
 .PHONY: all clean run run-all info list
 all: $(BINS)
@@ -42,9 +42,9 @@ run: $(BIN_TO_RUN)
 	&& CUDA_VISIBLE_DEVICES=$(CUDA_ID) ./$(BIN_TO_RUN)
 
 # List available run targets
-list:
+help:
 	@echo "Available binaries:"; printf "  %s\n" $(BINS)
-	@echo "Run a binary: make RUN_BIN=<name> run  (or RUN_BIN=1 for first, 2 for second, etc.)"
+	@echo "Run a binary: make KERNEL=<name> run  (or KERNEL=1 for first, 2 for second, etc.)"
 
 # Print discovery / config info
 info: ; @echo "SRCS = $(SRCS)"
