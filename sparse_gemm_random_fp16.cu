@@ -6,7 +6,6 @@
 #include <vector>
 #include <random>
 #include <algorithm>
-#include <cassert>
 #include <iomanip>
 
 #define CHECK_CUDA(func)                                                       \
@@ -19,105 +18,15 @@
     }                                                                          \
   }
 
-// Problem sizes
-// Must be multiples of tile sizes (16x8x32 for mma.sp)
-// We use a small size for demo
-#define M 1024
-#define N 1024
-#define K 1024
-
-// MMA.SP shape
-#define MMA_M 16
-#define MMA_N 8
-#define MMA_K 32
-
-// Block sizes
-#define BLOCK_M 128
-#define BLOCK_N 128
-#define BLOCK_K 32
-
-// Warp sizes
-#define WARP_M 32
-#define WARP_N 64
-#define WARP_K 32
-
-// Threads
-#define THREADS_PER_WARP 32
-#define WARPS_PER_BLOCK ((BLOCK_M * BLOCK_N) / (WARP_M * WARP_N)) // Simplified mapping
-// Actually we usually define threads per block fixed
-#define THREADS_PER_BLOCK 128
-
-// Sparsity constants
-#define SP_N 2
-#define SP_M 4
-
-// ------------------------------------------------------------------------------------------------
-// Encode / Load Options
-// ------------------------------------------------------------------------------------------------
-// 0: Do NOT reorder on host; use device-side mapping to match MMA/ldmatrix expectations
-// 1: Keep the legacy host reorder (ldmatrix-friendly layout)
-#define ENCODE_REORDER 0
-
 // Load methods
-// 1: ldmatrix with remapped addresses (no host reorder)
-// 2: manual lane/group loads (no ldmatrix)
+// 1: ldmatrix with address remap (raw encoding)
+// 2: manual lane/group loads (raw encoding)
 #define LOAD_METHOD_LDMATRIX_REMAP 1
 #define LOAD_METHOD_MANUAL_LANE    2
 
 // ------------------------------------------------------------------------------------------------
 // Host Utilities for 2:4 Sparsity
 // ------------------------------------------------------------------------------------------------
-
-// Helper to swap 8x8 subblocks in 16x16 tile for ldmatrix layout
-// Based on Samoyeds-Kernel reference
-void reorder_metadata_for_ldmatrix(std::vector<uint32_t>& metadata_uncompressed, int rows, int cols_indices) {
-    // metadata_uncompressed stores the 2-bit indices (0..3) as uint32_t
-    // We process 16x16 blocks of these indices
-    int unit_rows = 16;
-    int unit_cols = 16;
-    int half = 8;
-    
-    // In uncompressed view, cols index the *selected* values (pairs). 
-    // Each pair corresponds to 4 original columns.
-    // Wait, the "uncompressed" here refers to having explicit uint32 values for indices before packing bits.
-    // The "cols" dimension here corresponds to the number of *pairs* (K/2). 
-    // Wait, the reordering works on the logic of how threads map to data.
-    
-    for (int r = 0; r < rows; r += unit_rows) {
-        for (int c = 0; c < cols_indices; c += unit_cols) {
-            // Swap Top-Right (0..7, 8..15) with Bottom-Left (8..15, 0..7) within the 16x16 block
-            for (int i = 0; i < half; ++i) {
-                for (int j = half; j < unit_cols; ++j) {
-                    int tr_idx = (r + i) * cols_indices + (c + j);
-                    int bl_idx = (r + i + half) * cols_indices + (c + j - half);
-                    std::swap(metadata_uncompressed[tr_idx], metadata_uncompressed[bl_idx]);
-                }
-            }
-        }
-    }
-}
-
-
-
-// Reorder Values A (16x16 tile) to match Metadata reordering
-// Swap Top-Right (0..7, 8..15) with Bottom-Left (8..15, 0..7)
-void reorder_values_for_ldmatrix(std::vector<half>& A_sparse, int rows, int cols) {
-    int unit_rows = 16;
-    int unit_cols = 16; // A_sparse is 16x16 for K=32
-    int half = 8;
-    
-    for (int r = 0; r < rows; r += unit_rows) {
-        for (int c = 0; c < cols; c += unit_cols) {
-            for (int i = 0; i < half; ++i) {
-                for (int j = half; j < unit_cols; ++j) {
-                    int tr_idx = (r + i) * cols + (c + j);
-                    int bl_idx = (r + i + half) * cols + (c + j - half);
-                    std::swap(A_sparse[tr_idx], A_sparse[bl_idx]);
-                }
-            }
-        }
-    }
-}
 
 // Compress dense matrix A (MxK) to Sparse A (Mx(K/2)) and Metadata E (Mx(K/16))
 // Assuming K is multiple of 4? No, K must be multiple of 32 for tensor core.
@@ -131,9 +40,6 @@ void compress_matrix_host(
 ) {
     int k_sparse = k / 2;
     A_sparse.resize(m * k_sparse);
-    
-    // Uncompressed metadata indices (0..3)
-    int meta_cols_uncompressed = k / 2; 
     
     int meta_cols_packed = k / 32; // Number of uint32_t per row
     E_metadata.resize(m * meta_cols_packed);
@@ -172,14 +78,6 @@ void compress_matrix_host(
             meta_uncompressed[r * k_sparse + sparse_col_base + 1] = idx1;
         }
     }
-    
-    // Reorder metadata for Tensor Core access pattern (ldmatrix)
-    // NOTE: When ENCODE_REORDER==0, we keep raw encoding and compensate in device load.
-#if ENCODE_REORDER
-    reorder_metadata_for_ldmatrix(meta_uncompressed, m, k / 2);
-    // Reorder values matches metadata reordering!
-    reorder_values_for_ldmatrix(A_sparse, m, k / 2);
-#endif
     
     // Pack into uint32_t
     for (int i = 0; i < E_metadata.size(); ++i) {
@@ -309,131 +207,6 @@ __device__ __forceinline__ void load_b_frag_manual(int lane_id, const half* smem
     b_frag[3] = p3[0];
 }
 
-// Very simple single-CTA kernel for demo
-// Computes one 128x128x32 tile (or loops k)
-// Actually we will loop K.
-// Grid dimensions: (M/128, N/128)
-__global__ void sparse_gemm_kernel(
-    const half* __restrict__ A, // Compressed
-    const half* __restrict__ B,
-    float* __restrict__ C,
-    const uint32_t* __restrict__ E, // Metadata
-    int m, int n, int k
-) {
-    // Tiling hardcoded for M128 N128 K32
-    // Warp tiling M32 N64 K32 (Wait, standard is M64 N64?)
-    // Let's use 2x2 warps -> 4 warps. 128x128 tile.
-    // Warp 0: 0..63 x 0..63 (64x64) NO.
-    // Threads: 128. Warps: 4.
-    // Layout: 2x2 arrangement of warps.
-    // WarpTile: M64 x N64. 
-    // 2x2 WarpTiles cover 128x128.
-    
-    // We stick to simple 1 warp per tile demo? No, need efficiency?
-    // Let's implement one WarpTile per block to be super simple, M16 N8 K32 is too small.
-    // Let's do Block M64 N64. 1 Warp? No, 4 warps (32*4=128 threads).
-    // Let's do Block M64 N64. Warps: 2x2 of M32 N32?
-    // MMA is M16 N8. 
-    // Let's just implement a single warp kernel for simplicity of the "demo" which computes a small M16 N8.
-    // But user wants "2:4 sparse operator demo". 1024x1024 is requested size in main usually.
-    // I will implement a simplifed tiling loop.
-    
-    // Block: 128 threads (4 warps).
-    // Map warps to output tile 64x64.
-    // Warp 0: top-left 32x32? 
-    // With mma.sp M16 N8, we need loops inside warp.
-    
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
-    
-    // Global Tile Index
-    int block_row = blockIdx.y * 64; // Block processes 64 rows
-    int block_col = blockIdx.x * 64; // Block processes 64 cols
-    
-    // Warp offset in Block
-    // 4 warps. 2x2 layout.
-    // Warp 0: (0,0), Warp 1: (0, 32), Warp 2: (32, 0), Warp 3: (32, 32)
-    int warp_row_offset = (warp_id / 2) * 32;
-    int warp_col_offset = (warp_id % 2) * 32;
-    
-    // Accumulators
-    // Per thread, we hold a fragment of C.
-    // MMA M16 N8 K32. 
-    // To cover 32x32 with M16 N8:
-    // Rows: 2 steps (0, 16). Cols: 4 steps (0, 8, 16, 24).
-    // Total 8 MMA ops per warp per K-step.
-    
-    float c_frag[2][4][4] = {0}; // [RowStep][ColStep][Regs]
-    
-    // Loop over K
-    for (int k_idx = 0; k_idx < k; k_idx += 32) {
-        // Load Fragments
-        
-        // A Fragment: 4 regs. 16x32 sparse -> 16x16 compressed.
-        // B Fragment: 4 regs. 32x8.
-        // E Fragment: 1 reg.  16x32 metadata (packed to 16x1 uint32).
-        
-        // We need 2 Row steps for A (M32 -> 0..15, 16..31).
-        // A loading:
-        // We use ldmatrix.
-        // A is RowMajor. Address needs to be swizzled/smem? 
-        // For simplicity in this demo, we can just load from Global to Regs directly carefully?
-        // No, ldmatrix requires specific shared memory layout usually.
-        // Samoyeds uses ldmatrix from SMEM.
-        // Direct global load to registers is possible but slow.
-        // But for a single file demo, simple is better.
-        // However, mma.sp requires registers.
-        // Can we load to reg manually? Yes.
-        
-        // To avoid shared memory complexity in a simple demo, I'll load from GM to Regs.
-        // Warning: Performance will be low, but functional.
-        
-        // Iterate over sub-tiles of 16x8
-        for (int i = 0; i < 2; ++i) { // Row 0, 16
-            for (int j = 0; j < 4; ++j) { // Col 0, 8, 16, 24
-                
-                int m_curr = block_row + warp_row_offset + i * 16;
-                int n_curr = block_col + warp_col_offset + j * 8;
-                
-                // Load A (Compressed): 16x16 halfs (for K32).
-                // Need 4 regs (8 halfs) per thread.
-                // Lane ID mapping for mma.sp M16 N8 K32:
-                // documented in PTX ISA.
-                // A: row/col.
-                // Construct logic to load A from global A_sparse.
-                // A_sparse dim: M * (K/2).
-                // A Fragment layout is opaque. We assume standard row-major mapping if using "row" flag.
-                // Actually without ldmatrix, getting data into correct registers for mma is very hard.
-                // The register layout is complex.
-                // Easiest way "Self-Contained": Use ldmatrix with shared memory.
-                // I will add a small SMEM buffer.
-                
-                // ... This is getting complex for a 1-file demo without Cutlass headers.
-                // I will use a simplified approach: 1 Warp Block.
-                // Use `nvcuda::wmma`? No, mma.sp is not in standard wmma in older CUDA/standard headers? 
-                // It is in `cuda_fp16.h`?
-                // There is `nvcuda::wmma::experimental::precision::tf32` etc, but sparse?
-                // Sparse is low-level PTX usually.
-                
-                // I will assume the user accepts the complexity or I assume the risk.
-                // I'll stick to the manual packing and PTX.
-                // For global->reg loading without ldmatrix, it's risky due to layout.
-                // But Samoyeds kernel uses `load_matrix_sm_to_frag`.
-                
-                // Backup plan: Implementation is just the Setup and Verification, and the Kernel is a "placeholder" or "simple dense" if sparse is too hard? 
-                // NO. User asked for "sparse operator".
-                // I must do it.
-                
-                // I will implement a single MMA.SP usage on a single tile to prove it works.
-                // Single block, 1 warp.
-                // Process 1 tile: M16 N8 K32.
-                // Verify results.
-                // This is a "demo".
-            }
-        }
-    }
-}
-
 // SIMPLIFIED KERNEL FOR DEMO (Single M16 N8 K32 MMA)
 // This avoids tiling complexity and focuses on the Operator mechanics.
 template<int LOAD_METHOD>
@@ -480,35 +253,7 @@ __global__ void simple_sparse_mma_demo(
     
     __syncthreads();
 
-    // For ldmatrix path, make SMEM layout ldmatrix-friendly when host reorder is disabled
-#if !ENCODE_REORDER
-    if (LOAD_METHOD == LOAD_METHOD_LDMATRIX_REMAP) {
-        // Swap Top-Right (rows 0..7, cols 8..15) with Bottom-Left (rows 8..15, cols 0..7)
-        for (int idx = tid; idx < 64; idx += 32) {
-            int r = idx / 8;
-            int c = idx % 8;
-            int tr = r;
-            int tc = c + 8;
-            int bl = r + 8;
-            int bc = c;
-            half tmp = smem_A[tr * 16 + tc];
-            smem_A[tr * 16 + tc] = smem_A[bl * 16 + bc];
-            smem_A[bl * 16 + bc] = tmp;
-        }
-        // Metadata swap (packed): swap row r upper-half with row r+8 lower-half
-        if (tid < 8) {
-            uint32_t e0 = smem_E[tid];
-            uint32_t e1 = smem_E[tid + 8];
-            uint32_t lo0 = e0 & 0xFFFFu;
-            uint32_t hi0 = (e0 >> 16) & 0xFFFFu;
-            uint32_t lo1 = e1 & 0xFFFFu;
-            uint32_t hi1 = (e1 >> 16) & 0xFFFFu;
-            smem_E[tid] = (lo1 << 16) | lo0;
-            smem_E[tid + 8] = (hi1 << 16) | hi0;
-        }
-        __syncthreads();
-    }
-#endif
+    // Raw encoding: no shared-memory swap required
     
     // Load from SMEM to Registers
     // A: 16x16. Need 4 regs.
@@ -517,8 +262,17 @@ __global__ void simple_sparse_mma_demo(
     uint32_t smem_ptr_B = static_cast<uint32_t>(__cvta_generic_to_shared(smem_B));
 
     if (LOAD_METHOD == LOAD_METHOD_LDMATRIX_REMAP) {
-        // ldmatrix-based load (expects ldmatrix-friendly layout in SMEM)
-        uint32_t addr_A = smem_ptr_A + (tid % 16) * 16 * sizeof(half) + (tid / 16) * 8 * sizeof(half);
+        // ldmatrix-based load with address remap for raw encoding
+        int row = tid % 16;
+        int col = (tid / 16) * 8;
+        if (row < 8 && col == 8) {
+            row += 8;
+            col = 0;
+        } else if (row >= 8 && col == 0) {
+            row -= 8;
+            col = 8;
+        }
+        uint32_t addr_A = smem_ptr_A + row * 16 * sizeof(half) + col * sizeof(half);
         uint32_t addr_B = smem_ptr_B + tid * 8 * sizeof(half); // Row tid.
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                      : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
