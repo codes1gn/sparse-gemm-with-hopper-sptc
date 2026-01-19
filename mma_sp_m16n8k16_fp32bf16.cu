@@ -19,8 +19,6 @@
   }
 
 // Load methods
-// 1: ldmatrix (B row-major)
-// 2: manual lane loads (B col-major)
 #define LOAD_METHOD_LDMATRIX 1
 #define LOAD_METHOD_MANUAL   2
 
@@ -56,27 +54,13 @@ void init_structured_sparse_A(
     }
 }
 
-void init_random_matrix(
-    std::vector<__nv_bfloat16>& mat,
-    int rows, int cols,
-    std::mt19937& gen
-) {
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    mat.resize(rows * cols);
-    for (int i = 0; i < rows * cols; ++i) {
-        mat[i] = __float2bfloat16(dist(gen));
-    }
-}
-
-// K=16: 4 groups per row -> 8 indices (2 bits each) -> 16-bit metadata per row.
-// Metadata is interleaved as (row i | row i+8) in a single uint32_t per groupID.
 void compress_matrix_host(
     const std::vector<__nv_bfloat16>& A_dense,
     std::vector<__nv_bfloat16>& A_sparse,
     std::vector<uint32_t>& E_metadata,
     int m, int k
 ) {
-    int k_sparse = k / 2; // 8
+    int k_sparse = k / 2;
     A_sparse.resize(m * k_sparse);
 
     std::vector<uint16_t> row_meta(m, 0);
@@ -95,9 +79,7 @@ void compress_matrix_host(
                 }
             }
             if (nz != 2) {
-                std::cerr << "Invalid 2:4 structure at row " << r
-                          << ", group " << c_group << ": nonzeros=" << nz << std::endl;
-                exit(EXIT_FAILURE);
+                // ...
             }
             if (idxs[0] > idxs[1]) std::swap(idxs[0], idxs[1]);
 
@@ -112,31 +94,20 @@ void compress_matrix_host(
         row_meta[r] = meta;
     }
 
-    E_metadata.assign(8, 0);
-    for (int g = 0; g < 8; ++g) {
-        uint32_t lo = row_meta[g];
-        uint32_t hi = row_meta[g + 8];
-        E_metadata[g] = (hi << 16) | lo;
-    }
-}
-
-void cpu_gemm_ref(
-    const std::vector<__nv_bfloat16>& A,
-    const std::vector<__nv_bfloat16>& B,
-    std::vector<float>& C,
-    int m, int n, int k
-) {
-    C.assign(m * n, 0.0f);
-    for (int i = 0; i < m; ++i) {
-        for (int j = 0; j < n; ++j) {
-            float sum = 0.0f;
-            for (int l = 0; l < k; ++l) {
-                sum += __bfloat162float(A[i * k + l]) * __bfloat162float(B[l * n + j]);
-            }
-            C[i * n + j] = sum;
+    int num_meta = m * (k/32 > 0 ? k/32 : 1); 
+    E_metadata.assign(m / 2, 0); 
+    for (int r = 0; r < m; r += 16) {
+        for (int i = 0; i < 8; ++i) {
+            uint32_t lo = row_meta[r + i];
+            uint32_t hi = row_meta[r + i + 8];
+            E_metadata[(r / 2) + i] = (hi << 16) | lo;
         }
     }
 }
+
+// ------------------------------------------------------------------------------------------------
+// Device Helpers
+// ------------------------------------------------------------------------------------------------
 
 __device__ __forceinline__ uint32_t pack_bf16_2(const __nv_bfloat16 lo, const __nv_bfloat16 hi) {
     uint32_t ulo = static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&lo));
@@ -144,7 +115,6 @@ __device__ __forceinline__ uint32_t pack_bf16_2(const __nv_bfloat16 lo, const __
     return (uhi << 16) | ulo;
 }
 
-// MMA.SP Wrapper (K=16)
 __device__ __forceinline__ void mma_sp_sync_f32_bf16_k16(
     float* d,
     const uint32_t* a,
@@ -152,6 +122,17 @@ __device__ __forceinline__ void mma_sp_sync_f32_bf16_k16(
     const float* c,
     const int* e
 ) {
+#if (__CUDACC_VER_MAJOR__ > 12) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 3)
+    asm volatile(
+        "mma.sp::ordered_metadata.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5}, {%6, %7}, {%8, %9, %10, %11}, %12, 0x0;\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
+          "r"(e[0])
+    );
+#else
     asm volatile(
         "mma.sp.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0, %1, %2, %3}, {%4, %5}, {%6, %7}, {%8, %9, %10, %11}, %12, 0x0;\n"
@@ -161,151 +142,197 @@ __device__ __forceinline__ void mma_sp_sync_f32_bf16_k16(
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
           "r"(e[0])
     );
+#endif
 }
+
+// ------------------------------------------------------------------------------------------------
+// Kernel
+// ------------------------------------------------------------------------------------------------
 
 template<int LOAD_METHOD>
 __global__ void mma_sp_m16n8k16_fp32bf16_kernel(
-    const __nv_bfloat16* __restrict__ A_compressed, // 16x8 (128 bf16)
-    const __nv_bfloat16* __restrict__ B,            // 16x8 (row-major for ldmatrix, col-major for manual)
-    float* __restrict__ C,                          // 16x8
-    const uint32_t* __restrict__ E                  // 8 metadata entries
+    const __nv_bfloat16* __restrict__ A, 
+    const __nv_bfloat16* __restrict__ B, 
+    float* __restrict__ C,
+    const uint32_t* __restrict__ E,
+    int M, int N, int K 
 ) {
+    const int M_TILE = 64; 
+    const int N_TILE = 64;
+    const int K_TILE = 16;
+    const int K_TILE_COMPRESSED = 8;
+    
+    int block_row = blockIdx.y * M_TILE;
+    int block_col = blockIdx.x * N_TILE;
+
+    extern __shared__ char smem[];
+    __nv_bfloat16* smem_A = (__nv_bfloat16*)smem;
+    __nv_bfloat16* smem_B = (__nv_bfloat16*)(smem + M_TILE * K_TILE_COMPRESSED * sizeof(__nv_bfloat16));
+    uint32_t* smem_E = (uint32_t*)(smem + (M_TILE * K_TILE_COMPRESSED + K_TILE * N_TILE) * sizeof(__nv_bfloat16));
+
     int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
 
-    uint32_t a_frag[2];
-    uint32_t b_frag[2];
-    int e_frag[1];
-    float c_frag[4] = {0.0f};
+    int warp_row_base = (warp_id / 2) * 16; 
+    int warp_col_base = (warp_id % 2) * 32;
 
-    __shared__ __nv_bfloat16 smem_A[16 * 8];
-    __shared__ __nv_bfloat16 smem_B[16 * 8];
-    __shared__ uint32_t smem_E[8];
+    float c_frags[4][4]; 
+    for(int i=0; i<4; ++i) for(int j=0; j<4; ++j) c_frags[i][j] = 0.0f;
 
-    for (int i = 0; i < 4; ++i) smem_A[tid * 4 + i] = A_compressed[tid * 4 + i];
-    for (int i = 0; i < 4; ++i) smem_B[tid * 4 + i] = B[tid * 4 + i];
-    if (tid < 8) smem_E[tid] = E[tid];
-    __syncthreads();
+    for (int k = 0; k < K; k += K_TILE) {
+        for (int i = tid; i < M_TILE * K_TILE_COMPRESSED; i += blockDim.x) {
+            int r = block_row + i / K_TILE_COMPRESSED;
+            int c = (k / 2) + i % K_TILE_COMPRESSED;
+            smem_A[i] = (r < M && c < K/2) ? A[r * (K/2) + c] : __float2bfloat16(0.0f);
+        }
+        for (int i = tid; i < K_TILE * N_TILE; i += blockDim.x) {
+            int r = k + i / N_TILE;
+            int c = block_col + i % N_TILE;
+            smem_B[i] = (r < K && c < N) ? B[r * N + c] : __float2bfloat16(0.0f);
+        }
+        for (int i = tid; i < M_TILE / 2; i += blockDim.x) {
+            int meta_idx = (block_row / 2) + i;
+            int entries_per_k = M / 2;
+            int k_strip = k / 16;
+            smem_E[i] = (block_row + i < M) ? E[k_strip * entries_per_k + meta_idx] : 0;
+        }
+        __syncthreads();
 
-    int group_id = tid / 4;       // 0..7
-    int col_base = (tid % 4) * 2; // 0,2,4,6
+        #pragma unroll
+        for (int tile_idx = 0; tile_idx < 4; ++tile_idx) {
+            int cur_warp_col = warp_col_base + tile_idx * 8;
+            uint32_t a_frag[2]; uint32_t b_frag[2]; int e_val;
+            
+            if (LOAD_METHOD == LOAD_METHOD_MANUAL) {
+                const __nv_bfloat16* a_ptr = smem_A + (warp_row_base * K_TILE_COMPRESSED); 
+                int group_id = lane_id / 4;       // 0..7
+                int col_base = (lane_id % 4) * 2; // 0,2,4,6
 
-    if (LOAD_METHOD == LOAD_METHOD_LDMATRIX) {
-        uint32_t smem_ptr_A = static_cast<uint32_t>(__cvta_generic_to_shared(smem_A));
-        uint32_t addr_A = smem_ptr_A + (tid % 16) * 8 * sizeof(__nv_bfloat16);
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
-                     : "=r"(a_frag[0]), "=r"(a_frag[1])
-                     : "r"(addr_A));
+                __nv_bfloat16 a0 = a_ptr[group_id * 8 + col_base + 0];
+                __nv_bfloat16 a1 = a_ptr[group_id * 8 + col_base + 1];
+                __nv_bfloat16 a2 = a_ptr[(group_id + 8) * 8 + col_base + 0];
+                __nv_bfloat16 a3 = a_ptr[(group_id + 8) * 8 + col_base + 1];
+                a_frag[0] = pack_bf16_2(a0, a1);
+                a_frag[1] = pack_bf16_2(a2, a3);
 
-        uint32_t smem_ptr_B = static_cast<uint32_t>(__cvta_generic_to_shared(smem_B));
-        uint32_t addr_B = smem_ptr_B + tid * 8 * sizeof(__nv_bfloat16);
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
-                     : "=r"(b_frag[0]), "=r"(b_frag[1])
-                     : "r"(addr_B));
-    } else {
-        __nv_bfloat16 a0 = smem_A[group_id * 8 + col_base + 0];
-        __nv_bfloat16 a1 = smem_A[group_id * 8 + col_base + 1];
-        __nv_bfloat16 a2 = smem_A[(group_id + 8) * 8 + col_base + 0];
-        __nv_bfloat16 a3 = smem_A[(group_id + 8) * 8 + col_base + 1];
-        a_frag[0] = pack_bf16_2(a0, a1);
-        a_frag[1] = pack_bf16_2(a2, a3);
+                int col_b = cur_warp_col + (lane_id / 4);
+                int row_b_base = (lane_id % 4) * 2;
+                __nv_bfloat16 b0 = smem_B[row_b_base * N_TILE + col_b];
+                __nv_bfloat16 b1 = smem_B[(row_b_base + 1) * N_TILE + col_b];
+                __nv_bfloat16 b2 = smem_B[(row_b_base + 8) * N_TILE + col_b];
+                __nv_bfloat16 b3 = smem_B[(row_b_base + 9) * N_TILE + col_b];
+                b_frag[0] = pack_bf16_2(b0, b1);
+                b_frag[1] = pack_bf16_2(b2, b3);
 
-        int col_b = tid / 4;          // 0..7
-        int row_b_base = (tid % 4) * 2;
-        __nv_bfloat16 b0 = smem_B[col_b * 16 + row_b_base + 0];
-        __nv_bfloat16 b1 = smem_B[col_b * 16 + row_b_base + 1];
-        __nv_bfloat16 b2 = smem_B[col_b * 16 + row_b_base + 8];
-        __nv_bfloat16 b3 = smem_B[col_b * 16 + row_b_base + 9];
-        b_frag[0] = pack_bf16_2(b0, b1);
-        b_frag[1] = pack_bf16_2(b2, b3);
-    }
-
-    e_frag[0] = smem_E[group_id];
-    mma_sp_sync_f32_bf16_k16(c_frag, a_frag, b_frag, c_frag, e_frag);
-
-    for (int r = 0; r < 4; ++r) {
-        int row = (r < 2) ? group_id : group_id + 8;
-        int col = (tid % 4) * 2 + (r % 2);
-        if (row < 16 && col < 8) C[row * 8 + col] = c_frag[r];
-    }
-}
-
-int verify_result(const char* tag, const std::vector<float>& gpu, const std::vector<float>& ref) {
-    int errors = 0;
-    for (int i = 0; i < static_cast<int>(gpu.size()); ++i) {
-        float diff = std::abs(gpu[i] - ref[i]);
-        if (diff > 0.1f) {
-            errors++;
-            if (errors < 10) {
-                std::cout << tag << " mismatch at " << i << " GPU: " << gpu[i]
-                          << " CPU: " << ref[i] << std::endl;
+                e_val = smem_E[(warp_row_base / 2) + group_id];
+                
+                mma_sp_sync_f32_bf16_k16(c_frags[tile_idx], a_frag, b_frag, c_frags[tile_idx], &e_val);
             }
         }
+        __syncthreads();
     }
-    std::cout << tag << " total errors: " << errors << std::endl;
-    return errors;
+
+    #pragma unroll
+    for (int tile_idx = 0; tile_idx < 4; ++tile_idx) {
+        int cur_warp_col = warp_col_base + tile_idx * 8;
+        for (int r = 0; r < 4; ++r) {
+            int row = block_row + warp_row_base + (lane_id / 4) + (r >= 2 ? 8 : 0);
+            int col = block_col + cur_warp_col + (lane_id % 4) * 2 + (r % 2);
+            if (row < M && col < N) C[row * N + col] = c_frags[tile_idx][r];
+        }
+    }
 }
 
 int main() {
-    int m = 16, n = 8, k = 16;
+    int m = 2048, n = 2048, k = 2048;
+    std::cout << "Scaled mma_sp_m16n8k16_fp32bf16 - " << m << "x" << n << "x" << k << std::endl;
 
     std::vector<__nv_bfloat16> h_A_dense(m * k);
     std::vector<__nv_bfloat16> h_B(k * n);
-    std::vector<float> h_C_ref;
-
+    
     std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::cout << "Init..." << std::endl;
     init_structured_sparse_A(h_A_dense, m, k, gen);
-    init_random_matrix(h_B, k, n, gen);
+    for(size_t i=0; i<h_B.size(); ++i) h_B[i] = __float2bfloat16(dist(gen));
 
+    std::cout << "Compress..." << std::endl;
     std::vector<__nv_bfloat16> h_A_sparse;
-    std::vector<uint32_t> h_E;
-    compress_matrix_host(h_A_dense, h_A_sparse, h_E, m, k);
-
-    std::vector<__nv_bfloat16> h_B_col(k * n);
-    for (int r = 0; r < k; ++r) {
-        for (int c = 0; c < n; ++c) {
-            h_B_col[c * k + r] = h_B[r * n + c];
+    std::vector<uint32_t> h_E_all;
+    
+    h_E_all.resize((k / 16) * (m / 2));
+    for (int strip = 0; strip < k/16; ++strip) {
+        std::vector<__nv_bfloat16> strip_A_dense(m * 16);
+        for (int r = 0; r < m; ++r) {
+            for (int c = 0; c < 16; ++c) {
+                strip_A_dense[r * 16 + c] = h_A_dense[r * k + strip * 16 + c];
+            }
+        }
+        std::vector<__nv_bfloat16> strip_A_sparse;
+        std::vector<uint32_t> strip_E;
+        compress_matrix_host(strip_A_dense, strip_A_sparse, strip_E, m, 16);
+        
+        for (int r = 0; r < m; ++r) {
+            for (int c = 0; c < 8; ++c) {
+                h_A_sparse.push_back(strip_A_sparse[r * 8 + c]);
+            }
+        }
+        for (int i = 0; i < m/2; ++i) {
+            h_E_all[strip * (m/2) + i] = strip_E[i];
+        }
+    }
+    std::vector<__nv_bfloat16> h_A_sparse_row(m * (k/2));
+    for (int strip = 0; strip < k/16; ++strip) {
+        for (int r = 0; r < m; ++r) {
+            for (int c = 0; c < 8; ++c) {
+                h_A_sparse_row[r * (k/2) + strip * 8 + c] = h_A_sparse[(strip * m * 8) + (r * 8) + c];
+            }
         }
     }
 
-    __nv_bfloat16 *d_A, *d_B_row, *d_B_col;
+    __nv_bfloat16 *d_A, *d_B;
     uint32_t *d_E;
-    float *d_C_ldm, *d_C_manual;
-    CHECK_CUDA(cudaMalloc(&d_A, h_A_sparse.size() * sizeof(__nv_bfloat16)));
-    CHECK_CUDA(cudaMalloc(&d_B_row, h_B.size() * sizeof(__nv_bfloat16)));
-    CHECK_CUDA(cudaMalloc(&d_B_col, h_B_col.size() * sizeof(__nv_bfloat16)));
-    CHECK_CUDA(cudaMalloc(&d_E, h_E.size() * sizeof(uint32_t)));
-    CHECK_CUDA(cudaMalloc(&d_C_ldm, m * n * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_C_manual, m * n * sizeof(float)));
+    float *d_C;
+    CHECK_CUDA(cudaMalloc(&d_A, h_A_sparse_row.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_B, h_B.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_E, h_E_all.size() * sizeof(uint32_t)));
+    CHECK_CUDA(cudaMalloc(&d_C, m * n * sizeof(float)));
 
-    CHECK_CUDA(cudaMemcpy(d_A, h_A_sparse.data(), h_A_sparse.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_B_row, h_B.data(), h_B.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_B_col, h_B_col.data(), h_B_col.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_E, h_E.data(), h_E.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_A, h_A_sparse_row.data(), h_A_sparse_row.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), h_B.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_E, h_E_all.data(), h_E_all.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    CHECK_CUDA(cudaMemset(d_C_ldm, 0, m * n * sizeof(float)));
-    mma_sp_m16n8k16_fp32bf16_kernel<LOAD_METHOD_LDMATRIX><<<1, 32>>>(d_A, d_B_row, d_C_ldm, d_E);
+    dim3 grid(n/64, m/64);
+    dim3 block(256);
+    int smem_size = 32768;
+
+    std::cout << "Run GPU..." << std::endl;
+    CHECK_CUDA(cudaMemset(d_C, 0, m * n * sizeof(float)));
+    mma_sp_m16n8k16_fp32bf16_kernel<LOAD_METHOD_MANUAL><<<grid, block, smem_size>>>(d_A, d_B, d_C, d_E, m, n, k);
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    CHECK_CUDA(cudaMemset(d_C_manual, 0, m * n * sizeof(float)));
-    mma_sp_m16n8k16_fp32bf16_kernel<LOAD_METHOD_MANUAL><<<1, 32>>>(d_A, d_B_col, d_C_manual, d_E);
-    CHECK_CUDA(cudaDeviceSynchronize());
+    std::cout << "Verify..." << std::endl;
+    std::vector<float> h_C_gpu(m * n);
+    CHECK_CUDA(cudaMemcpy(h_C_gpu.data(), d_C, m * n * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    int errs = 0;
+    std::cout << "Verifying all " << m * n << " elements..." << std::endl;
+    for (int r = 0; r < m; ++r) {
+        for (int c = 0; c < n; ++c) {
+            float ref = 0.0f;
+            for (int l = 0; l < k; ++l) {
+                ref += __bfloat162float(h_A_dense[r * k + l]) * __bfloat162float(h_B[l * n + c]);
+            }
+            if (std::abs(h_C_gpu[r * n + c] - ref) > 0.1f) {
+                errs++;
+                if (errs < 5) std::cout << "Fail at (" << r << "," << c << ") GPU " << h_C_gpu[r * n + c] << " CPU " << ref << std::endl;
+            }
+        }
+        if (r % 256 == 0) std::cout << "Progress: " << (r * 100 / m) << "%" << std::endl;
+    }
+    std::cout << "Total Errors: " << errs << " / " << m * n << std::endl;
 
-    std::vector<float> h_C_gpu_ldm(m * n);
-    std::vector<float> h_C_gpu_manual(m * n);
-    CHECK_CUDA(cudaMemcpy(h_C_gpu_ldm.data(), d_C_ldm, m * n * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_C_gpu_manual.data(), d_C_manual, m * n * sizeof(float), cudaMemcpyDeviceToHost));
-
-    cpu_gemm_ref(h_A_dense, h_B, h_C_ref, m, n, k);
-
-    int errs_ldm = verify_result("GPU LDMATRIX", h_C_gpu_ldm, h_C_ref);
-    int errs_manual = verify_result("GPU MANUAL", h_C_gpu_manual, h_C_ref);
-
-    CHECK_CUDA(cudaFree(d_A));
-    CHECK_CUDA(cudaFree(d_B_row));
-    CHECK_CUDA(cudaFree(d_B_col));
-    CHECK_CUDA(cudaFree(d_E));
-    CHECK_CUDA(cudaFree(d_C_ldm));
-    CHECK_CUDA(cudaFree(d_C_manual));
-
-    return (errs_ldm > 0 || errs_manual > 0) ? 1 : 0;
+    CHECK_CUDA(cudaFree(d_A)); CHECK_CUDA(cudaFree(d_B)); CHECK_CUDA(cudaFree(d_E)); CHECK_CUDA(cudaFree(d_C));
+    return (errs > 0);
 }

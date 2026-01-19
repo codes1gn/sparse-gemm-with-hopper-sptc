@@ -1,9 +1,20 @@
+# Compiled Binaries
 sparse_gemm
 sparse_gemm_random
 sparse_gemm_fp8
 sparse_gemm_tf32
 sparse_gemm_magic
+mma_sp_m*
+mma_tf32_test
+
+# Patterns
 *_recheck
 *_bin
 *.o
 *.a
+*.exe
+*.out
+
+# Directories
+build/
+bin/

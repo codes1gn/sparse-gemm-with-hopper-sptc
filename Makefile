@@ -23,8 +23,10 @@ ifeq ($(ENABLE_FP8),1)
 endif
 BINS := $(SRCS:.cu=)
 
-# Map numeric RUN_BIN to binary name (1=first, 2=second, etc.)
-BIN_TO_RUN := $(strip $(if $(filter 1 2, $(KERNEL)), $(word $(KERNEL), $(BINS)), $(KERNEL)))
+# Map numeric KERNEL to binary name (1=first, 2=second, etc.)
+# Logic: If KERNEL is a number, use word, else use as name.
+IS_NUM := $(shell echo $(KERNEL) | grep -E '^[0-9]+$$')
+BIN_TO_RUN := $(strip $(if $(IS_NUM), $(word $(KERNEL), $(BINS)), $(KERNEL)))
 
 .PHONY: all clean run run-all info list
 all: $(BINS)
@@ -36,20 +38,23 @@ all: $(BINS)
 # FP8 kernels require sm_89+ (Hopper); build them with sm_90.
 mma_sp_%fp8: ARCH := $(ARCH_FP8)
 
-# Default run: runs the configured RUN_BIN (must exist)
+# Default run: runs the configured BIN_TO_RUN (must exist)
 run: $(BIN_TO_RUN)
 	@echo "Running $(BIN_TO_RUN) on CUDA device $(CUDA_ID)..." \
 	&& CUDA_VISIBLE_DEVICES=$(CUDA_ID) ./$(BIN_TO_RUN)
 
-# List available run targets
+# List available run targets with indices
 help:
-	@echo "Available binaries:"; printf "  %s\n" $(BINS)
-	@echo "Run a binary: make KERNEL=<name> run  (or KERNEL=1 for first, 2 for second, etc.)"
+	@echo "Available binaries:"
+	@n=1; for b in $(BINS); do echo "  $$n. $$b"; n=$$((n+1)); done
+	@echo ""
+	@echo "Run a binary: make KERNEL=<name_or_id> run"
+	@echo "Example: make KERNEL=1 run"
 
 # Print discovery / config info
 info: ; @echo "SRCS = $(SRCS)"
 	@echo "BINS = $(BINS)"
-	@echo "RUN_BIN = $(RUN_BIN) (BIN_TO_RUN = $(BIN_TO_RUN))"
+	@echo "KERNEL = $(KERNEL) (BIN_TO_RUN = $(BIN_TO_RUN))"
 	@echo "CUDA_ID = $(CUDA_ID) (override with 'make CUDA_ID=0')"
 
 clean:
