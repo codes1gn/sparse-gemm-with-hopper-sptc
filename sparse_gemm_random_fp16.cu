@@ -52,6 +52,19 @@
 #define SP_M 4
 
 // ------------------------------------------------------------------------------------------------
+// Encode / Load Options
+// ------------------------------------------------------------------------------------------------
+// 0: Do NOT reorder on host; use device-side mapping to match MMA/ldmatrix expectations
+// 1: Keep the legacy host reorder (ldmatrix-friendly layout)
+#define ENCODE_REORDER 0
+
+// Load methods
+// 1: ldmatrix with remapped addresses (no host reorder)
+// 2: manual lane/group loads (no ldmatrix)
+#define LOAD_METHOD_LDMATRIX_REMAP 1
+#define LOAD_METHOD_MANUAL_LANE    2
+
+// ------------------------------------------------------------------------------------------------
 // Host Utilities for 2:4 Sparsity
 // ------------------------------------------------------------------------------------------------
 
@@ -161,9 +174,12 @@ void compress_matrix_host(
     }
     
     // Reorder metadata for Tensor Core access pattern (ldmatrix)
+    // NOTE: When ENCODE_REORDER==0, we keep raw encoding and compensate in device load.
+#if ENCODE_REORDER
     reorder_metadata_for_ldmatrix(meta_uncompressed, m, k / 2);
     // Reorder values matches metadata reordering!
     reorder_values_for_ldmatrix(A_sparse, m, k / 2);
+#endif
     
     // Pack into uint32_t
     for (int i = 0; i < E_metadata.size(); ++i) {
@@ -207,7 +223,7 @@ __device__ __forceinline__ void mma_sp_sync_f32_f16(
                    // Distributed: 1 register per thread.
 ) {
     asm volatile(
-        "mma.sp.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 "
+        "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 "
         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9, %10, %11}, {%12, %13, %14, %15}, %16, 0x0;\n"
         : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
         : "r"(a[0]), "r"(a[2]), "r"(a[1]), "r"(a[3]),
@@ -215,6 +231,82 @@ __device__ __forceinline__ void mma_sp_sync_f32_f16(
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
           "r"(e[0])
     );
+}
+
+// Variant without A-reg swap (a0,a1,a2,a3)
+__device__ __forceinline__ void mma_sp_sync_f32_f16_a0123(
+    float* d,
+    const int* a,
+    const int* b,
+    const float* c,
+    const int* e
+) {
+    asm volatile(
+        "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9, %10, %11}, {%12, %13, %14, %15}, %16, 0x0;\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
+          "r"(e[0])
+    );
+}
+
+// Metadata lane mapping for mma.sp.m16n8k32 with sparsity selector f=0
+// Threads T0/T1 within each group of 4 lanes provide metadata for rows (groupID, groupID+8).
+__device__ __forceinline__ uint32_t load_metadata_for_lane(int lane_id, const uint32_t* smem_E) {
+    int groupID = lane_id >> 2;          // 0..7
+    int threadID = lane_id & 0x3;        // 0..3
+    if (threadID == 0) return smem_E[groupID];
+    if (threadID == 1) return smem_E[groupID + 8];
+    return 0;
+}
+
+// Manual A fragment load for sparse mma.m16n8k32 (raw compressed layout)
+__device__ __forceinline__ void load_a_frag_manual(int lane_id, const half* smem_A, int* a_frag) {
+    int groupID = lane_id >> 2;         // 0..7
+    int threadID = lane_id & 0x3;       // 0..3
+    // ai: 0..7 (two values per register)
+    half vals[8];
+    #pragma unroll
+    for (int ai = 0; ai < 8; ++ai) {
+        int row = (ai < 2 || (ai >= 4 && ai < 6)) ? groupID : (groupID + 8);
+        int col_base = (ai < 4) ? (threadID * 4) : (threadID * 4 + 16);
+        int chunk = col_base / 4; // 0..7
+        int val_idx = ai & 0x1;   // 0 or 1 (two stored values per 4-wide chunk)
+        vals[ai] = smem_A[row * 16 + chunk * 2 + val_idx];
+    }
+    // Pack two halfs per register (low, high)
+    const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&vals[0]);
+    const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&vals[2]);
+    const uint32_t* p2 = reinterpret_cast<const uint32_t*>(&vals[4]);
+    const uint32_t* p3 = reinterpret_cast<const uint32_t*>(&vals[6]);
+    a_frag[0] = p0[0];
+    a_frag[1] = p1[0];
+    a_frag[2] = p2[0];
+    a_frag[3] = p3[0];
+}
+
+// Manual B fragment load for mma.m16n8k32 (row-major B, KxN)
+__device__ __forceinline__ void load_b_frag_manual(int lane_id, const half* smem_B, int* b_frag) {
+    int groupID = lane_id >> 2;         // 0..7
+    int threadID = lane_id & 0x3;       // 0..3
+    half vals[8];
+    #pragma unroll
+    for (int bi = 0; bi < 8; ++bi) {
+        int row = (threadID * 2) + (bi & 0x1);
+        row += (bi / 2) * 8;            // rows 0..31
+        int col = groupID;              // N=8 columns
+        vals[bi] = smem_B[row * 8 + col];
+    }
+    const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&vals[0]);
+    const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&vals[2]);
+    const uint32_t* p2 = reinterpret_cast<const uint32_t*>(&vals[4]);
+    const uint32_t* p3 = reinterpret_cast<const uint32_t*>(&vals[6]);
+    b_frag[0] = p0[0];
+    b_frag[1] = p1[0];
+    b_frag[2] = p2[0];
+    b_frag[3] = p3[0];
 }
 
 // Very simple single-CTA kernel for demo
@@ -344,6 +436,7 @@ __global__ void sparse_gemm_kernel(
 
 // SIMPLIFIED KERNEL FOR DEMO (Single M16 N8 K32 MMA)
 // This avoids tiling complexity and focuses on the Operator mechanics.
+template<int LOAD_METHOD>
 __global__ void simple_sparse_mma_demo(
     const half* __restrict__ A_compressed, // 16x16 (256 halfs)
     const half* __restrict__ B,            // 32x8  (256 halfs)
@@ -386,126 +479,68 @@ __global__ void simple_sparse_mma_demo(
     if (tid < 16) smem_E[tid] = E[tid];
     
     __syncthreads();
+
+    // For ldmatrix path, make SMEM layout ldmatrix-friendly when host reorder is disabled
+#if !ENCODE_REORDER
+    if (LOAD_METHOD == LOAD_METHOD_LDMATRIX_REMAP) {
+        // Swap Top-Right (rows 0..7, cols 8..15) with Bottom-Left (rows 8..15, cols 0..7)
+        for (int idx = tid; idx < 64; idx += 32) {
+            int r = idx / 8;
+            int c = idx % 8;
+            int tr = r;
+            int tc = c + 8;
+            int bl = r + 8;
+            int bc = c;
+            half tmp = smem_A[tr * 16 + tc];
+            smem_A[tr * 16 + tc] = smem_A[bl * 16 + bc];
+            smem_A[bl * 16 + bc] = tmp;
+        }
+        // Metadata swap (packed): swap row r upper-half with row r+8 lower-half
+        if (tid < 8) {
+            uint32_t e0 = smem_E[tid];
+            uint32_t e1 = smem_E[tid + 8];
+            uint32_t lo0 = e0 & 0xFFFFu;
+            uint32_t hi0 = (e0 >> 16) & 0xFFFFu;
+            uint32_t lo1 = e1 & 0xFFFFu;
+            uint32_t hi1 = (e1 >> 16) & 0xFFFFu;
+            smem_E[tid] = (lo1 << 16) | lo0;
+            smem_E[tid + 8] = (hi1 << 16) | hi0;
+        }
+        __syncthreads();
+    }
+#endif
     
-    // Load from SMEM to Registers using `ldmatrix`
+    // Load from SMEM to Registers
     // A: 16x16. Need 4 regs.
-    // ldmatrix.sync.aligned.m8n8.x4.shared.b16 (loads 4 matrices? No)
-    // mma.sp A needs 4 regs.
-    // Use `ldmatrix.sync.aligned.m8n8.x4.trans.b16`?
-    // We use .num 4.
-    
+    // B: 32x8. Need 4 regs.
     uint32_t smem_ptr_A = static_cast<uint32_t>(__cvta_generic_to_shared(smem_A));
     uint32_t smem_ptr_B = static_cast<uint32_t>(__cvta_generic_to_shared(smem_B));
-    
-    // Address calculation is tricky.
-    // Simplified: We rely on the fact that for specific layouts, just linear loading might assume standard layout if packed correctly.
-    // But for this demo, I'll attempt a direct `ldmatrix`.
-    
-    // A Load (m16k32 compressed -> 16x16)
-    // We view it as four 8x8 matrices? Or one 16x16.
-    // mma.sp expects specific distribution.
-    // Layout: 
-    //   Thread 0-31 hold different parts.
-    //   We use standard `ldmatrix.sync.aligned.m8n8.x4.b16` to load 4 regs.
-    //   Address for lane:
-    //   ldmatrix takes a pointer. It assumes the warp threads provide pointers to the rows.
-    //   Threads 0..7 load row 0..7?
-    //   We setup pointers.
-    
-    // A Pointers (Row Major)
-    // Lane 0..7 -> Row 0..7
-    // Lane 8..15 -> Row 8..15
-    // Lane 16..23 -> Row 0..7 (col 8..15?)
-    // Lane 24..31 -> Row 8..15 (col 8..15?)
-    // This is for m16n16?
-    // mma.sp requires M16 K32 input (16x16 storage).
-    
-    // Let's rely on manual load loop that mimics Samoyeds `load_matrix_sm_to_frag`
-    // which wraps `ldmatrix`.
-    // Samoyeds uses `ldmatrix`.
-    
-    // Since I cannot easily guarantee the SMEM layout/swizzle without complex code,
-    // I will use `ldmatrix.sync.aligned.m8n8.x4.shared.b16 {r0, r1, r2, r3}, [ptr];`
-    // Lane i: ptr = &smem_A[ (i % 8) * 16 + (i / 8) * 8 ? ] 
-    // This is getting into the weeds.
-    
-    // STRATEGY CHANGE:
-    // To ensure "Self-Contained" and correct, and avoid debug hell with swizzles:
-    // I will implement CPU verification and ONE simple kernel that compiles and runs "Success".
-    // I will use inline PTX for `ldmatrix` with standard row-major mapping logic.
-    // Addresses A:
-    //   Group 0 (T0-7): Rows 0-7, Cols 0-7.
-    //   Group 1 (T8-15): Rows 8-15, Cols 0-7.
-    //   Group 2 (T16-23): Rows 0-7, Cols 8-15.
-    //   Group 3 (T24-31): Rows 8-15, Cols 8-15.
-    // Ptr for T0: &smem_A[0]
-    // Ptr for T8: &smem_A[8*16]
-    // Ptr for T16: &smem_A[8]
-    // ...
-    
-    int tid_in_group = tid % 8;
-    int group_id = tid / 8;
-    
-    // A Pointers
-    // Row stride is 16 (halfs) = 32 bytes.
-    // Each ldmatrix x4 loads 16x16? No. x4 loads 32 bytes * 4 = 128 bytes per thread? No.
-    // ldmatrix x4 loads 4 chunks of 8 halfs? 
-    // Let's use `ldmatrix.sync.aligned.m8n8.x4`
-    // Effective tile is 16x16.
-    // Mapping:
-    // T0-T31 provide 32 addresses.
-    // For x4, valid are T0-7, T16-23? Or T0-31?
-    // "Threads 0..31 specify the addresses..."
-    // "m8n8.x4": Returns 4 registers.
-    // Corresponds to 4 8x8 matrices.
-    // A (16x16) is exactly 4 8x8 blocks.
-    // Top-Left, Bottom-Left, Top-Right, Bottom-Right.
-    // T0-7: Rows 0-7.
-    // T8-15: Rows 8-15.
-    // T16-23: Rows 0-7.
-    // T24-31: Rows 8-15.
-    
-    // wait, ldmatrix usually takes row address.
-    // Each thread specifies address of the row it holds?
-    // T0 -> Row 0. T1 -> Row 1.
-    // T0..7 cover 8 rows.
-    // m8n8.x4 means each thread gets 4 registers?
-    // Documentation says "The four registers ... contain data ... from the same matrix configuration spread over the warp"
-    
-    // Let's just calculate pointer simply:
-    // A: 16 rows.
-    // We map T0..15 to Row 0..15. T16..31 to Row 0..15.
-    // But we need cols 0..7 and 8..15.
-    // Let's assume standard row major smem.
-    
-    uint32_t addr_A = smem_ptr_A + (tid % 16) * 16 * sizeof(half) + (tid / 16) * 8 * sizeof(half);
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];" : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3]) : "r"(addr_A));
 
-    // B Load (32x8)
-    // Need 4 regs (8 halfs).
-    // B is k32n8.
-    // Use .col layout? Transpose logic?
-    // Simplest: .trans. 
-    // Or just load rows assuming B is ColMajor in logic?
-    // mma.sp B is ColMajor usually favored.
-    // Let's assume B is stored in SMEM as 32x8.
-    // We use ldmatrix x4 would mean 32x8 is 2 16x8s? 4 8x8s.
-    // 32x8 is 4 8x8 blocks stacked vertically.
-    // T0-31.
-    // T0-7: Row 0-7. T8-15: Row 8-15. T16-23: Row 16-23. T24-31: Row 24-31.
-    // Col 0-7.
-    uint32_t addr_B = smem_ptr_B + tid * 8 * sizeof(half); // Row tid.
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];" : "=r"(b_frag[0]), "=r"(b_frag[1]), "=r"(b_frag[2]), "=r"(b_frag[3]) : "r"(addr_B));
+    if (LOAD_METHOD == LOAD_METHOD_LDMATRIX_REMAP) {
+        // ldmatrix-based load (expects ldmatrix-friendly layout in SMEM)
+        uint32_t addr_A = smem_ptr_A + (tid % 16) * 16 * sizeof(half) + (tid / 16) * 8 * sizeof(half);
+        uint32_t addr_B = smem_ptr_B + tid * 8 * sizeof(half); // Row tid.
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
+                     : "r"(addr_A));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(b_frag[0]), "=r"(b_frag[1]), "=r"(b_frag[2]), "=r"(b_frag[3])
+                     : "r"(addr_B));
+    } else {
+        // Manual fragment load using PTX-documented lane mapping
+        load_a_frag_manual(tid, smem_A, a_frag);
+        load_b_frag_manual(tid, smem_B, b_frag);
+    }
 
-    // E Metadata Load (16x1)
-    // Distributed: Groups of 4 threads share 1 int32.
-    // 32 bits = 2 rows (K=32, 8 chunks * 2 bits = 16 bits/row).
-    // 8 ints cover 16 rows.
-    // T0..3 -> Index 0.
-    e_frag[0] = smem_E[tid / 4];
+    // E Metadata Load (per-lane mapping for f=0)
+    e_frag[0] = load_metadata_for_lane(tid, smem_E);
     
     // MMA
-    mma_sp_sync_f32_f16(c_frag, a_frag, b_frag, c_frag, e_frag);
+    if (LOAD_METHOD == LOAD_METHOD_LDMATRIX_REMAP) {
+        mma_sp_sync_f32_f16(c_frag, a_frag, b_frag, c_frag, e_frag);
+    } else {
+        mma_sp_sync_f32_f16_a0123(c_frag, a_frag, b_frag, c_frag, e_frag);
+    }
     
     // Store C (Linear)
     
@@ -525,7 +560,7 @@ __global__ void simple_sparse_mma_demo(
 }
 
 // Debug helper
-void print_matrix(const char* name, float* data, int rows, int cols) {
+void print_matrix(const char* name, const float* data, int rows, int cols) {
     std::cout << name << ":" << std::endl;
     for(int i=0; i<rows; ++i) {
         for(int j=0; j<cols; ++j) {
@@ -566,21 +601,28 @@ int main() {
     // GPU Alloc & Run
     half *d_A, *d_B;
     uint32_t *d_E;
-    float *d_C;
+    float *d_C_ldm, *d_C_manual;
     CHECK_CUDA(cudaMalloc(&d_A, h_A_sparse.size() * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&d_B, h_B.size() * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&d_E, h_E.size() * sizeof(uint32_t)));
-    CHECK_CUDA(cudaMalloc(&d_C, h_C.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_C_ldm, h_C.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_C_manual, h_C.size() * sizeof(float)));
     CHECK_CUDA(cudaMemcpy(d_A, h_A_sparse.data(), h_A_sparse.size() * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), h_B.size() * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_E, h_E.data(), h_E.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemset(d_C, 0, h_C.size() * sizeof(float)));
-    
-    simple_sparse_mma_demo<<<1, 32>>>(d_A, d_B, d_C, d_E);
+
+    CHECK_CUDA(cudaMemset(d_C_ldm, 0, h_C.size() * sizeof(float)));
+    simple_sparse_mma_demo<LOAD_METHOD_LDMATRIX_REMAP><<<1, 32>>>(d_A, d_B, d_C_ldm, d_E);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUDA(cudaMemset(d_C_manual, 0, h_C.size() * sizeof(float)));
+    simple_sparse_mma_demo<LOAD_METHOD_MANUAL_LANE><<<1, 32>>>(d_A, d_B, d_C_manual, d_E);
     CHECK_CUDA(cudaDeviceSynchronize());
     
-    std::vector<float> h_C_gpu(m * n);
-    CHECK_CUDA(cudaMemcpy(h_C_gpu.data(), d_C, m * n * sizeof(float), cudaMemcpyDeviceToHost));
+    std::vector<float> h_C_gpu_ldm(m * n);
+    std::vector<float> h_C_gpu_manual(m * n);
+    CHECK_CUDA(cudaMemcpy(h_C_gpu_ldm.data(), d_C_ldm, m * n * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_C_gpu_manual.data(), d_C_manual, m * n * sizeof(float), cudaMemcpyDeviceToHost));
     
     // CPU Reference
     std::vector<float> h_C_ref(m * n, 0.0f);
@@ -621,22 +663,24 @@ int main() {
     }
     
     // Verify (Standard Linear)
-    // The kernel A-operand reordering (0,2,1,3) should fix the row output permutation.
-    int errors = 0;
-    for(int i=0; i<m*n; ++i) {
-        float diff = std::abs(h_C_gpu[i] - h_C_ref[i]);
-        if(diff > 0.1f) {
-            errors++;
-            if (errors < 10) std::cout << "Mismatch at " << i << " GPU: " << h_C_gpu[i] << " CPU: " << h_C_ref[i] << std::endl;
+    auto verify = [&](const char* tag, const std::vector<float>& gpu) {
+        int errors = 0;
+        for(int i=0; i<m*n; ++i) {
+            float diff = std::abs(gpu[i] - h_C_ref[i]);
+            if(diff > 0.1f) {
+                errors++;
+                if (errors < 10) std::cout << tag << " mismatch at " << i << " GPU: " << gpu[i] << " CPU: " << h_C_ref[i] << std::endl;
+            }
         }
-    }
-    
-    std::cout << "Total Errors: " << errors << std::endl;
-    // Always print errors for debug
-    if (errors > 0 || errors == 0) {
-         print_matrix("GPU Output", h_C_gpu.data(), m, n);
-         print_matrix("CPU Reference", h_C_ref.data(), m, n);
-    }
-    
-    return errors > 0 ? 1 : 0;
+        std::cout << tag << " total errors: " << errors << std::endl;
+        if (errors > 0) {
+            print_matrix(tag, gpu.data(), m, n);
+        }
+        return errors;
+    };
+
+    int err_ldm = verify("GPU LDMATRIX_REMAP", h_C_gpu_ldm);
+    int err_manual = verify("GPU MANUAL_LANE", h_C_gpu_manual);
+
+    return (err_ldm > 0 || err_manual > 0) ? 1 : 0;
 }
