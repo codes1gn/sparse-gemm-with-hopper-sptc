@@ -5,7 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <random>
-#include <algorithm>
+#include <cmath>
 #include <iomanip>
 
 #define CHECK_CUDA(func)                                                       \
@@ -28,68 +28,185 @@
 // Host Utilities for 2:4 Sparsity
 // ------------------------------------------------------------------------------------------------
 
-// Compress dense matrix A (MxK) to Sparse A (Mx(K/2)) and Metadata E (Mx(K/16))
-// Assuming K is multiple of 4? No, K must be multiple of 32 for tensor core.
+// Initialize a strictly 2:4 structured sparse matrix A (MxK).
+// For each group of 4, exactly two entries are non-zero.
+void init_structured_sparse_A(
+    std::vector<half>& A_dense,
+    int m, int k,
+    std::mt19937& gen
+) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> pick(0, 3);
+
+    A_dense.assign(m * k, __float2half(0.0f));
+    for (int r = 0; r < m; ++r) {
+        for (int c_group = 0; c_group < k / 4; ++c_group) {
+            int idx0 = pick(gen);
+            int idx1 = pick(gen);
+            while (idx1 == idx0) idx1 = pick(gen);
+            if (idx0 > idx1) std::swap(idx0, idx1);
+
+            float v0 = dist(gen);
+            float v1 = dist(gen);
+            if (v0 == 0.0f) v0 = 1.0f;
+            if (v1 == 0.0f) v1 = -1.0f;
+
+            int base = r * k + c_group * 4;
+            A_dense[base + idx0] = __float2half(v0);
+            A_dense[base + idx1] = __float2half(v1);
+        }
+    }
+}
+
+// Initialize a dense random matrix
+void init_random_matrix(
+    std::vector<half>& mat,
+    int rows, int cols,
+    std::mt19937& gen
+) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    mat.resize(rows * cols);
+    for (int i = 0; i < rows * cols; ++i) {
+        mat[i] = __float2half(dist(gen));
+    }
+}
+
+// Encode dense matrix A (MxK) to Sparse A (Mx(K/2)) and Metadata E (Mx(K/16))
+// Assumes A is already strictly 2:4 structured sparse (two nonzeros per group of 4).
 // The metadata is packed: 16 indices (for 16 pairs = 64 original elements) -> 32 bits.
 // Actually 1 metadata element (32-bit) covers 32 input elements of A (16 pairs).
 void compress_matrix_host(
-    const std::vector<half>& A_dense, 
-    std::vector<half>& A_sparse, 
+    const std::vector<half>& A_dense,
+    std::vector<half>& A_sparse,
     std::vector<uint32_t>& E_metadata,
     int m, int k
 ) {
     int k_sparse = k / 2;
     A_sparse.resize(m * k_sparse);
-    
+
     int meta_cols_packed = k / 32; // Number of uint32_t per row
-    E_metadata.resize(m * meta_cols_packed);
-    
-    std::vector<uint32_t> meta_uncompressed(m * (k / 2));
-    
+    E_metadata.assign(m * meta_cols_packed, 0);
+
     for (int r = 0; r < m; ++r) {
         for (int c_group = 0; c_group < k / 4; ++c_group) {
-            // Process group of 4 elements: A_dense[r, c_group*4 + 0..3]
-            // Pick 2 largest magnitude
-            struct ValIdx { float val; int idx; };
-            std::vector<ValIdx> group(4);
-            for(int i=0; i<4; ++i) {
-                int col = c_group * 4 + i;
-                group[i] = { std::abs(__half2float(A_dense[r * k + col])), i };
+            int base = r * k + c_group * 4;
+            int idxs[2] = {-1, -1};
+            int nz = 0;
+            for (int i = 0; i < 4; ++i) {
+                float v = __half2float(A_dense[base + i]);
+                if (v != 0.0f) {
+                    if (nz < 2) idxs[nz] = i;
+                    nz++;
+                }
             }
-            // Sort descending
-            std::sort(group.begin(), group.end(), [](const ValIdx& a, const ValIdx& b){
-                return a.val > b.val;
-            });
-            
-            // Keep indices of top 2, sorted ascending
-            int idx0 = group[0].idx;
-            int idx1 = group[1].idx;
-            if (idx0 > idx1) std::swap(idx0, idx1);
-            
-            // Fill sparse matrix and uncompressed metadata
+            if (nz != 2) {
+                std::cerr << "Invalid 2:4 structure at row " << r
+                          << ", group " << c_group << ": nonzeros=" << nz << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            if (idxs[0] > idxs[1]) std::swap(idxs[0], idxs[1]);
+
             int sparse_col_base = c_group * 2;
-            
-            // Value 0
-            A_sparse[r * k_sparse + sparse_col_base + 0] = A_dense[r * k + c_group * 4 + idx0];
-            meta_uncompressed[r * k_sparse + sparse_col_base + 0] = idx0;
-            
-            // Value 1
-            A_sparse[r * k_sparse + sparse_col_base + 1] = A_dense[r * k + c_group * 4 + idx1];
-            meta_uncompressed[r * k_sparse + sparse_col_base + 1] = idx1;
+            A_sparse[r * k_sparse + sparse_col_base + 0] = A_dense[base + idxs[0]];
+            A_sparse[r * k_sparse + sparse_col_base + 1] = A_dense[base + idxs[1]];
+
+            int pack_col = c_group / 8;
+            int pair_idx = (c_group % 8) * 2;
+            uint32_t packed = E_metadata[r * meta_cols_packed + pack_col];
+            packed |= (static_cast<uint32_t>(idxs[0]) << (pair_idx * 2));
+            packed |= (static_cast<uint32_t>(idxs[1]) << ((pair_idx + 1) * 2));
+            E_metadata[r * meta_cols_packed + pack_col] = packed;
         }
     }
-    
-    // Pack into uint32_t
-    for (int i = 0; i < E_metadata.size(); ++i) {
-        uint32_t packed = 0;
-        for (int j = 0; j < 16; ++j) {
-            // Metadata format: lower bits first?
-            // "The first encoded index is stored in the 2 LSBs"
-            uint32_t val = meta_uncompressed[i * 16 + j];
-            packed |= (val << (j * 2));
+}
+
+void cpu_gemm_ref(
+    const std::vector<half>& A,
+    const std::vector<half>& B,
+    std::vector<float>& C,
+    int m, int n, int k
+) {
+    C.assign(m * n, 0.0f);
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) {
+            float sum = 0.0f;
+            for (int l = 0; l < k; ++l) {
+                sum += __half2float(A[i * k + l]) * __half2float(B[l * n + j]);
+            }
+            C[i * n + j] = sum;
         }
-        E_metadata[i] = packed;
     }
+}
+
+template<int LOAD_METHOD>
+__global__ void mma_sp_m16n8k32_fp32fp16_kernel(
+    const half* __restrict__ A_compressed,
+    const half* __restrict__ B,
+    float* __restrict__ C,
+    const uint32_t* __restrict__ E
+);
+
+void print_matrix(const char* name, const float* data, int rows, int cols);
+
+void run_gpu_demo(
+    const std::vector<half>& A_sparse,
+    const std::vector<half>& B,
+    const std::vector<uint32_t>& E,
+    int m, int n,
+    std::vector<float>& out_ldm,
+    std::vector<float>& out_manual
+) {
+    half *d_A, *d_B;
+    uint32_t *d_E;
+    float *d_C_ldm, *d_C_manual;
+
+    CHECK_CUDA(cudaMalloc(&d_A, A_sparse.size() * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&d_B, B.size() * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&d_E, E.size() * sizeof(uint32_t)));
+    CHECK_CUDA(cudaMalloc(&d_C_ldm, m * n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_C_manual, m * n * sizeof(float)));
+
+    CHECK_CUDA(cudaMemcpy(d_A, A_sparse.data(), A_sparse.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_B, B.data(), B.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_E, E.data(), E.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    CHECK_CUDA(cudaMemset(d_C_ldm, 0, m * n * sizeof(float)));
+    mma_sp_m16n8k32_fp32fp16_kernel<LOAD_METHOD_LDMATRIX_REMAP><<<1, 32>>>(d_A, d_B, d_C_ldm, d_E);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUDA(cudaMemset(d_C_manual, 0, m * n * sizeof(float)));
+    mma_sp_m16n8k32_fp32fp16_kernel<LOAD_METHOD_MANUAL_LANE><<<1, 32>>>(d_A, d_B, d_C_manual, d_E);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    out_ldm.resize(m * n);
+    out_manual.resize(m * n);
+    CHECK_CUDA(cudaMemcpy(out_ldm.data(), d_C_ldm, m * n * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(out_manual.data(), d_C_manual, m * n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA(cudaFree(d_A));
+    CHECK_CUDA(cudaFree(d_B));
+    CHECK_CUDA(cudaFree(d_E));
+    CHECK_CUDA(cudaFree(d_C_ldm));
+    CHECK_CUDA(cudaFree(d_C_manual));
+}
+
+int verify_result(const char* tag, const std::vector<float>& gpu, const std::vector<float>& ref, int rows, int cols) {
+    int errors = 0;
+    for (int i = 0; i < static_cast<int>(gpu.size()); ++i) {
+        float diff = std::abs(gpu[i] - ref[i]);
+        if (diff > 0.1f) {
+            errors++;
+            if (errors < 10) {
+                std::cout << tag << " mismatch at " << i << " GPU: " << gpu[i]
+                          << " CPU: " << ref[i] << std::endl;
+            }
+        }
+    }
+    std::cout << tag << " total errors: " << errors << std::endl;
+    if (errors > 0) {
+        print_matrix(tag, gpu.data(), rows, cols);
+    }
+    return errors;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -155,8 +272,16 @@ __device__ __forceinline__ void mma_sp_sync_f32_f16_a0123(
 __device__ __forceinline__ uint32_t load_metadata_for_lane(int lane_id, const uint32_t* smem_E) {
     int groupID = lane_id >> 2;          // 0..7
     int threadID = lane_id & 0x3;        // 0..3
-    if (threadID == 0) return smem_E[groupID];
-    if (threadID == 1) return smem_E[groupID + 8];
+    if (threadID == 0 || threadID == 1) {
+        uint32_t e0 = smem_E[groupID];
+        uint32_t e1 = smem_E[groupID + 8];
+        uint32_t lo0 = e0 & 0xFFFFu;
+        uint32_t hi0 = (e0 >> 16) & 0xFFFFu;
+        uint32_t lo1 = e1 & 0xFFFFu;
+        uint32_t hi1 = (e1 >> 16) & 0xFFFFu;
+        if (threadID == 0) return (lo1 << 16) | lo0;
+        return (hi1 << 16) | hi0;
+    }
     return 0;
 }
 
@@ -207,10 +332,10 @@ __device__ __forceinline__ void load_b_frag_manual(int lane_id, const half* smem
     b_frag[3] = p3[0];
 }
 
-// SIMPLIFIED KERNEL FOR DEMO (Single M16 N8 K32 MMA)
-// This avoids tiling complexity and focuses on the Operator mechanics.
+// Single tile M16 N8 K32 MMA demonstrating `mma.sp` loads with metadata.
+// This focuses on operator wiring and dataset compression rather than tiling.
 template<int LOAD_METHOD>
-__global__ void simple_sparse_mma_demo(
+__global__ void mma_sp_m16n8k32_fp32fp16_kernel(
     const half* __restrict__ A_compressed, // 16x16 (256 halfs)
     const half* __restrict__ B,            // 32x8  (256 halfs)
     float* __restrict__ C,                 // 16x8  (128 floats)
@@ -333,108 +458,25 @@ int main() {
     
     // Random Init
     std::mt19937 gen(42);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    
-    for(int r=0; r<m; ++r) {
-        for(int c=0; c<k; ++c) {
-            // Ensure 2:4 sparsity structure is "possible" to select meaningfully
-            // We set 2 values large, 2 small per group
-            float val = dist(gen);
-            if ((c % 4) < 2) val += 2.0f; // Bias to ensure selection
-            h_A_dense[r*k + c] = __float2half(val);
-        }
-    }
-    
-    for(int i=0; i<k*n; ++i) h_B[i] = __float2half(dist(gen));
+    init_structured_sparse_A(h_A_dense, m, k, gen);
+    init_random_matrix(h_B, k, n, gen);
     
     // Compress
     std::vector<half> h_A_sparse;
     std::vector<uint32_t> h_E;
     compress_matrix_host(h_A_dense, h_A_sparse, h_E, m, k);
     
-    // GPU Alloc & Run
-    half *d_A, *d_B;
-    uint32_t *d_E;
-    float *d_C_ldm, *d_C_manual;
-    CHECK_CUDA(cudaMalloc(&d_A, h_A_sparse.size() * sizeof(half)));
-    CHECK_CUDA(cudaMalloc(&d_B, h_B.size() * sizeof(half)));
-    CHECK_CUDA(cudaMalloc(&d_E, h_E.size() * sizeof(uint32_t)));
-    CHECK_CUDA(cudaMalloc(&d_C_ldm, h_C.size() * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_C_manual, h_C.size() * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_A, h_A_sparse.data(), h_A_sparse.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), h_B.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_E, h_E.data(), h_E.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-
-    CHECK_CUDA(cudaMemset(d_C_ldm, 0, h_C.size() * sizeof(float)));
-    simple_sparse_mma_demo<LOAD_METHOD_LDMATRIX_REMAP><<<1, 32>>>(d_A, d_B, d_C_ldm, d_E);
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    CHECK_CUDA(cudaMemset(d_C_manual, 0, h_C.size() * sizeof(float)));
-    simple_sparse_mma_demo<LOAD_METHOD_MANUAL_LANE><<<1, 32>>>(d_A, d_B, d_C_manual, d_E);
-    CHECK_CUDA(cudaDeviceSynchronize());
-    
-    std::vector<float> h_C_gpu_ldm(m * n);
-    std::vector<float> h_C_gpu_manual(m * n);
-    CHECK_CUDA(cudaMemcpy(h_C_gpu_ldm.data(), d_C_ldm, m * n * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_C_gpu_manual.data(), d_C_manual, m * n * sizeof(float), cudaMemcpyDeviceToHost));
+    // GPU Run
+    std::vector<float> h_C_gpu_ldm;
+    std::vector<float> h_C_gpu_manual;
+    run_gpu_demo(h_A_sparse, h_B, h_E, m, n, h_C_gpu_ldm, h_C_gpu_manual);
     
     // CPU Reference
-    std::vector<float> h_C_ref(m * n, 0.0f);
-    // Reconstruct effective A
-    std::vector<float> A_eff(m * k, 0.0f);
-    for (int r = 0; r < m; ++r) {
-        for (int c_group = 0; c_group < k / 4; ++c_group) {
-            // Re-identify selection logic (same as compression)
-            // Ideally we expose the mask from compression_host but for now duplicate logic
-            struct ValIdx { float val; int idx; };
-            std::vector<ValIdx> group(4);
-            for(int i=0; i<4; ++i) {
-                int col = c_group * 4 + i;
-                group[i] = { std::abs(__half2float(h_A_dense[r * k + col])), i };
-            }
-            std::sort(group.begin(), group.end(), [](const ValIdx& a, const ValIdx& b){ return a.val > b.val; });
-            
-            bool keep[4] = {false};
-            keep[group[0].idx] = true; 
-            keep[group[1].idx] = true;
-            
-            for(int i=0; i<4; ++i) {
-                if(keep[i]) A_eff[r * k + c_group * 4 + i] = __half2float(h_A_dense[r * k + c_group * 4 + i]);
-            }
-        }
-    }
+    std::vector<float> h_C_ref;
+    cpu_gemm_ref(h_A_dense, h_B, h_C_ref, m, n, k);
     
-    // Matmul
-    for(int i=0; i<m; ++i) {
-        for(int j=0; j<n; ++j) {
-            float sum = 0.0f;
-            for(int l=0; l<k; ++l) {
-                // B is simple K*N layout
-                sum += A_eff[i*k + l] * __half2float(h_B[l*n + j]);
-            }
-            h_C_ref[i*n + j] = sum;
-        }
-    }
-    
-    // Verify (Standard Linear)
-    auto verify = [&](const char* tag, const std::vector<float>& gpu) {
-        int errors = 0;
-        for(int i=0; i<m*n; ++i) {
-            float diff = std::abs(gpu[i] - h_C_ref[i]);
-            if(diff > 0.1f) {
-                errors++;
-                if (errors < 10) std::cout << tag << " mismatch at " << i << " GPU: " << gpu[i] << " CPU: " << h_C_ref[i] << std::endl;
-            }
-        }
-        std::cout << tag << " total errors: " << errors << std::endl;
-        if (errors > 0) {
-            print_matrix(tag, gpu.data(), m, n);
-        }
-        return errors;
-    };
-
-    int err_ldm = verify("GPU LDMATRIX_REMAP", h_C_gpu_ldm);
-    int err_manual = verify("GPU MANUAL_LANE", h_C_gpu_manual);
+    int err_ldm = verify_result("GPU LDMATRIX_REMAP", h_C_gpu_ldm, h_C_ref, m, n);
+    int err_manual = verify_result("GPU MANUAL_LANE", h_C_gpu_manual, h_C_ref, m, n);
 
     return (err_ldm > 0 || err_manual > 0) ? 1 : 0;
 }
