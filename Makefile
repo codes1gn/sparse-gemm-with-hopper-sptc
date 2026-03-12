@@ -3,10 +3,14 @@ NVCC = /usr/local/cuda/bin/nvcc
 ARCH = -arch=sm_80
 ARCH_FP8 = -arch=sm_90a
 FLAGS = -O3 -std=c++14
+CUTLASS_INCLUDES = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include
+FLAGS_WGMMA = -O3 -std=c++17 $(CUTLASS_INCLUDES)
 
-# Default CUDA device id (can be overridden on the make command line)
+AUTO_CUDA_ID := $(shell nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | sort -t, -k2 -nr | head -n1 | cut -d, -f1)
+
+# Default CUDA device id (auto-selects GPU with most free memory; can be overridden)
 # Example: `make CUDA_ID=0 run-foo` or `make CUDA_ID=0 RUN_BIN=foo run`
-CUDA_ID ?= 0
+CUDA_ID ?= $(if $(AUTO_CUDA_ID),$(AUTO_CUDA_ID),0)
 
 # Default binary to run with `make run` (can be overridden)
 KERNEL ?= mma_sp_m16n8k32_fp32fp16
@@ -35,8 +39,10 @@ all: $(BINS)
 %: %.cu
 	$(NVCC) $(ARCH) $(FLAGS) -o $@ $<
 
-# FP8 kernels require sm_89+ (Hopper); build them with sm_90.
+# FP8 and WGMMA kernels require Hopper; build them with sm_90a.
 mma_sp_%fp8: ARCH := $(ARCH_FP8)
+mma_sp_wgmma_%: ARCH := $(ARCH_FP8)
+mma_sp_wgmma_%: FLAGS := $(FLAGS_WGMMA)
 
 # Default run: runs the configured BIN_TO_RUN (must exist)
 run: $(BIN_TO_RUN)

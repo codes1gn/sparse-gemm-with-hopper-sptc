@@ -5,6 +5,7 @@ sparse_gemm_fp8
 sparse_gemm_tf32
 sparse_gemm_magic
 mma_sp_m*
+mma_sp_wgmma_m64n8k32_fp32fp16
 mma_tf32_test
 
 # Patterns
