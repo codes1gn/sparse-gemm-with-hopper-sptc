@@ -56,6 +56,8 @@ help:
 	@echo ""
 	@echo "Run a binary: make KERNEL=<name_or_id> run"
 	@echo "Example: make KERNEL=1 run"
+	@echo "WGMMA examples: make KERNEL=mma_sp_wgmma_m64n16k32_fp32fp16 run"
+	@echo "                make KERNEL=mma_sp_wgmma_m64n32k32_fp32bf16 run"
 
 # Print discovery / config info
 info: ; @echo "SRCS = $(SRCS)"
