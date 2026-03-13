@@ -67,3 +67,10 @@ info: ; @echo "SRCS = $(SRCS)"
 
 clean:
 	rm -f $(BINS)
+
+bench: bench/bench
+	@echo "Running benchmarks..." \
+	&& CUDA_VISIBLE_DEVICES=$(CUDA_ID) ./bench/bench
+
+bench/bench: bench/bench.cu bench/bench_fp16.cuh bench/bench_e4m3.cuh bench/bench_common.hpp
+	$(NVCC) $(ARCH_FP8) -O3 -std=c++17 -o $@ $<
