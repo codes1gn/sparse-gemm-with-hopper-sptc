@@ -1,9 +1,12 @@
 #pragma once
 
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <cute/atom/mma_traits_sm90_gmma_sparse.hpp>
+#include <cute/tensor.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -17,10 +20,10 @@
 #define CHECK_CUDA(func)                                                       \
   {                                                                            \
     cudaError_t status__ = (func);                                             \
-    if (status__ != cudaSuccess) {                                            \
+    if (status__ != cudaSuccess) {                                             \
       std::cerr << "CUDA Error: " << cudaGetErrorString(status__)            \
                 << " at line " << __LINE__ << std::endl;                     \
-      std::exit(EXIT_FAILURE);                                                \
+      std::exit(EXIT_FAILURE);                                                 \
     }                                                                          \
   }
 
@@ -39,48 +42,7 @@ inline float elem_to_float<__nv_bfloat16>(__nv_bfloat16 x) {
 
 template <>
 inline float elem_to_float<__nv_fp8_e4m3>(__nv_fp8_e4m3 x) {
-  return __nv_fp8_e4m3_to_float(x);
-}
-
-template <>
-inline float elem_to_float<__nv_fp8_e5m2>(__nv_fp8_e5m2 x) {
-  return __nv_fp8_e5m2_to_float(x);
-}
-
-template <typename T>
-inline T float_to_elem(float x);
-
-template <>
-inline half float_to_elem<half>(half x) {
-  return __float2half_rn(x);
-}
-
-template <>
-inline __nv_bfloat16 float_to_elem<__nv_bfloat16>(__nv_bfloat16 x) {
-  return __float2bfloat16_rn(x);
-}
-
-template <>
-inline __nv_fp8_e4m3 float_to_elem<__nv_fp8_e4m3>(float x) {
-  return __float2nv_fp8_e4m3_rn(x);
-}
-
-template <>
-inline __nv_fp8_e5m2 float_to_elem<__nv_fp8_e5m2>(float x) {
-  return __float2nv_fp8_e5m2_rn(x);
-}
-
-template <typename T>
-inline float elem_to_float(T x);
-
-template <>
-inline float elem_to_float<half>(half x) {
-  return __half2float(x);
-}
-
-template <>
-inline float elem_to_float<__nv_bfloat16>(__nv_bfloat16 x) {
-  return __bfloat162float(x);
+  return static_cast<float>(x);
 }
 
 template <typename T>
@@ -94,6 +56,11 @@ inline half float_to_elem<half>(float x) {
 template <>
 inline __nv_bfloat16 float_to_elem<__nv_bfloat16>(float x) {
   return __float2bfloat16(x);
+}
+
+template <>
+inline __nv_fp8_e4m3 float_to_elem<__nv_fp8_e4m3>(float x) {
+  return __nv_fp8_e4m3(x);
 }
 
 template <typename Element>
@@ -208,7 +175,28 @@ void compress_structured_sparse_a(
       a_sparse[row * (k / 2) + sparse_col + 0] = a_dense[base + idxs[0]];
       a_sparse[row * (k / 2) + sparse_col + 1] = a_dense[base + idxs[1]];
 
-      uint8_t nibble = static_cast<uint8_t>(idxs[0] | (idxs[1] << 2));
+      uint8_t nibble = 0;
+      if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
+        if (idxs[0] == 0 && idxs[1] == 1) {
+          nibble = 0x4;
+        } else if (idxs[0] == 1 && idxs[1] == 2) {
+          nibble = 0x9;
+        } else if (idxs[0] == 2 && idxs[1] == 3) {
+          nibble = 0xE;
+        } else if (idxs[0] == 0 && idxs[1] == 2) {
+          nibble = 0x8;
+        } else if (idxs[0] == 1 && idxs[1] == 3) {
+          nibble = 0xD;
+        } else if (idxs[0] == 0 && idxs[1] == 3) {
+          nibble = 0xC;
+        } else {
+          std::cerr << "Invalid fp8 2:4 indices at row " << row << ", group " << group
+                    << ": (" << idxs[0] << ", " << idxs[1] << ")" << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+      } else {
+        nibble = static_cast<uint8_t>(idxs[0] | (idxs[1] << 2));
+      }
       int byte_idx = row * (k / 8) + group / 2;
       if ((group & 1) == 0) {
         e_bytes[byte_idx] = nibble;
@@ -306,17 +294,184 @@ inline int select_best_device() {
 }
 
 constexpr int kRawBlockM = 64;
-constexpr int kRawBlockK = 32;
-constexpr int kRawSparseK = kRawBlockK / 2;
-constexpr int kRawMetaBytes = kRawBlockK / 8;
 constexpr int kRawThreads = 128;
-constexpr int kRawASmemElements = 2048;
+
+using RawFp8MetadataElementEMma = cute::sparse_elem<8, uint8_t>;
+using RawFp8MetadataTensorEAtom = decltype(cute::make_ordered_layout(
+    cute::Shape<cute::Shape<cute::_8, cute::_2, cute::_4>, cute::Shape<cute::_32, cute::_2, cute::Int<1>>>{},
+    cute::Step<cute::Step<cute::_3, cute::_1, cute::_6>, cute::Step<cute::_0, cute::_5, cute::_2>>{}));
+using RawFp8MetadataSmemLayoutAtomE = cute::ComposedLayout<
+    cute::Swizzle<0, 4, 3>,
+    cute::smem_sparse_ptr_flag_bits<RawFp8MetadataElementEMma::sparsity, cute::sizeof_bits_v<uint8_t>>,
+    RawFp8MetadataTensorEAtom>;
+using RawFp8MetadataSmemLayoutE = decltype(cute::tile_to_shape(
+    RawFp8MetadataSmemLayoutAtomE{},
+    cute::Shape<cute::_64, cute::_64>{}));
+constexpr int kRawFp8MetadataSmemBytes = cute::cosize_v<RawFp8MetadataSmemLayoutE>;
+
+template <class MMAAtom, class AtomLayoutMNK, class PermutationMNK, class ETensor>
+CUTE_HOST_DEVICE constexpr auto raw_thrfrg_e(
+    cute::TiledMMA<MMAAtom, AtomLayoutMNK, PermutationMNK> const& mma,
+    ETensor&& etensor) {
+  using TMma = cute::TiledMMA<MMAAtom, AtomLayoutMNK, PermutationMNK>;
+
+  auto t_tile = cute::make_tile(cute::get<0>(PermutationMNK{}), cute::get<2>(PermutationMNK{}));
+  auto t_tensor = cute::logical_divide(etensor, t_tile);
+
+  auto e_tile = cute::make_tile(
+      cute::make_layout(cute::size<0>(typename TMma::AtomShape_MNK{})),
+      cute::make_layout(cute::size<2>(typename TMma::AtomShape_MNK{})));
+  auto e_tensor = cute::zipped_divide(t_tensor, e_tile);
+
+  using AtomLayoutE_TV = typename TMma::Atom::Traits::ELayout;
+  auto tv_tensor = e_tensor.compose(AtomLayoutE_TV{}, cute::_);
+
+  auto thr_tile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(cute::size<1>(mma.thr_layout_vmnk_)),
+          cute::make_layout(cute::size<3>(mma.thr_layout_vmnk_))));
+  return cute::zipped_divide(tv_tensor, thr_tile);
+}
+
+template <class... MArgs>
+CUTE_HOST_DEVICE constexpr auto raw_get_layout_e_tv(cute::TiledMMA<MArgs...> const& mma) {
+  auto ref_e = cute::make_layout(cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<2>(mma)));
+  auto layout_e_tv = raw_thrfrg_e(mma, ref_e);
+
+  auto etile = cute::make_tile(
+      cute::_,
+      cute::make_tile(
+          cute::make_layout(
+              cute::make_shape(cute::size<1>(mma.thr_layout_vmnk_), cute::size<2>(mma.thr_layout_vmnk_)),
+              cute::make_stride(cute::Int<1>{}, cute::Int<0>{})),
+          cute::_));
+
+  auto thridx_to_thrid = cute::right_inverse(mma.thr_layout_vmnk_);
+  return layout_e_tv.compose(etile, cute::_).compose(thridx_to_thrid, cute::_);
+}
+
+template <class... MArgs, class ETensor>
+CUTE_HOST_DEVICE constexpr auto raw_partition_e(cute::ThrMMA<MArgs...> const& thr_mma, ETensor&& etensor) {
+  auto thr_tensor = cute::make_tensor(static_cast<ETensor&&>(etensor).data(), raw_thrfrg_e(thr_mma, etensor.layout()));
+  auto thr_vmk = cute::make_coord(
+      cute::get<0>(thr_mma.thr_vmnk_),
+      cute::make_coord(cute::get<1>(thr_mma.thr_vmnk_), cute::get<3>(thr_mma.thr_vmnk_)));
+  return thr_tensor(thr_vmk, cute::make_coord(cute::_, cute::repeat<cute::rank<1, 1>(thr_tensor)>(cute::_)));
+}
+
+template <class... CArgs, class... MArgs>
+CUTE_HOST_DEVICE constexpr auto raw_make_tiled_copy_e(
+    cute::Copy_Atom<CArgs...> const& copy_atom,
+    cute::TiledMMA<MArgs...> const& mma) {
+  return cute::make_tiled_copy_impl(
+      copy_atom,
+      raw_get_layout_e_tv(mma),
+      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<2>(mma)));
+}
+
+__device__ inline auto raw_fp8_smem_e_tensor(uint8_t* smem_e) {
+  return cute::make_tensor(
+      cute::make_smem_ptr(cute::recast_ptr<RawFp8MetadataElementEMma>(smem_e)),
+      RawFp8MetadataSmemLayoutE{});
+}
+
+template <int BlockN>
+struct RawFp8MetadataMmaOp;
+
+template <>
+struct RawFp8MetadataMmaOp<8> {
+  using type = cute::SM90::GMMA::SPARSE::GMMA_64x8x64_F32E4M3E4M3_SS_TN<>;
+};
+
+template <>
+struct RawFp8MetadataMmaOp<16> {
+  using type = cute::SM90::GMMA::SPARSE::GMMA_64x16x64_F32E4M3E4M3_SS_TN<>;
+};
+
+template <>
+struct RawFp8MetadataMmaOp<32> {
+  using type = cute::SM90::GMMA::SPARSE::GMMA_64x32x64_F32E4M3E4M3_SS_TN<>;
+};
+
+template <>
+struct RawFp8MetadataMmaOp<64> {
+  using type = cute::SM90::GMMA::SPARSE::GMMA_64x64x64_F32E4M3E4M3_SS_TN<>;
+};
+
+template <>
+struct RawFp8MetadataMmaOp<128> {
+  using type = cute::SM90::GMMA::SPARSE::GMMA_64x128x64_F32E4M3E4M3_SS_TN<>;
+};
+
+template <>
+struct RawFp8MetadataMmaOp<256> {
+  using type = cute::SM90::GMMA::SPARSE::GMMA_64x256x64_F32E4M3E4M3_SS_TN<>;
+};
+
+template <int BlockN>
+__device__ inline uint32_t raw_fp8_metadata_u32(uint8_t* smem_e, int tid) {
+  using MmaOp = typename RawFp8MetadataMmaOp<BlockN>::type;
+  using TiledMma = decltype(cute::make_tiled_mma(MmaOp{}));
+
+  auto sE = raw_fp8_smem_e_tensor(smem_e);
+  TiledMma tiled_mma;
+  auto thread_mma = tiled_mma.get_thread_slice(tid);
+  auto tCsE = raw_partition_e(thread_mma, sE);
+  auto tCrE = cute::make_fragment_like<RawFp8MetadataElementEMma>(tCsE);
+
+  auto copy_atom_e = cute::Copy_Atom<cute::AutoVectorizingCopy, uint32_t>{};
+  auto smem_tiled_copy_e = raw_make_tiled_copy_e(copy_atom_e, tiled_mma);
+  auto smem_thr_copy_e = smem_tiled_copy_e.get_thread_slice(tid);
+  auto tEsE = smem_thr_copy_e.partition_S(sE);
+  auto tErE = smem_thr_copy_e.retile_D(tCrE);
+  cute::copy(smem_tiled_copy_e, tEsE, tErE);
+
+  auto rE = cute::recast<uint32_t>(tCrE);
+  return rE[0];
+}
+
+template <typename Element>
+struct RawSparseConfig;
+
+template <>
+struct RawSparseConfig<half> {
+  static constexpr int kBlockK = 32;
+  static constexpr int kSparseK = kBlockK / 2;
+  static constexpr int kMetaBytes = kBlockK / 8;
+  static constexpr int kASmemElements = kRawBlockM * kSparseK;
+  static constexpr int kESmemBytes = kRawBlockM * kMetaBytes;
+  static constexpr uint32_t kADescLeading = 64;
+  static constexpr uint32_t kADescStride = 8;
+};
+
+template <>
+struct RawSparseConfig<__nv_bfloat16> {
+  static constexpr int kBlockK = 32;
+  static constexpr int kSparseK = kBlockK / 2;
+  static constexpr int kMetaBytes = kBlockK / 8;
+  static constexpr int kASmemElements = kRawBlockM * kSparseK;
+  static constexpr int kESmemBytes = kRawBlockM * kMetaBytes;
+  static constexpr uint32_t kADescLeading = 64;
+  static constexpr uint32_t kADescStride = 8;
+};
+
+template <>
+struct RawSparseConfig<__nv_fp8_e4m3> {
+  static constexpr int kBlockK = 64;
+  static constexpr int kSparseK = kBlockK / 2;
+  static constexpr int kMetaBytes = kBlockK / 8;
+  static constexpr int kASmemElements = kRawBlockM * kSparseK;
+  static constexpr int kESmemBytes = kRawFp8MetadataSmemBytes;
+  static constexpr uint32_t kADescLeading = 64;
+  static constexpr uint32_t kADescStride = 8;
+};
 
 template <int BlockN, typename Element>
 struct RawSharedStorage {
-  alignas(128) Element smem_A[kRawASmemElements];
-  alignas(128) Element smem_B[BlockN * kRawBlockK];
-  alignas(128) uint8_t smem_E[kRawBlockM * kRawMetaBytes];
+  alignas(128) Element smem_A[RawSparseConfig<Element>::kASmemElements];
+  alignas(128) Element smem_B[BlockN * RawSparseConfig<Element>::kBlockK];
+  alignas(128) uint8_t smem_E[RawSparseConfig<Element>::kESmemBytes];
 };
 
 __device__ inline uint32_t smem_ptr_as_uint(void const* ptr) {
@@ -362,27 +517,151 @@ __device__ inline int smem_a_index(int row, int col) {
   return (col & 7) + ((row >> 3) * 64) + ((row & 7) * 8) + ((col >> 3) * 512);
 }
 
+__device__ inline int smem_a_index_k64_e4m3(int row, int col) {
+  return (col & 15) + row * 16 + ((col >> 4) * 1024);
+}
+
+template <typename Element>
+__device__ inline int raw_smem_a_index(int row, int col) {
+  if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
+    return smem_a_index_k64_e4m3(row, col);
+  } else {
+    return smem_a_index(row, col);
+  }
+}
+
 template <int BlockN>
 __device__ inline int smem_b_index(int col, int kk) {
   return (col & 7) + ((col >> 3) * 64) + ((kk >> 3) * (BlockN * 8)) + ((kk & 7) * 8);
+}
+
+template <int BlockN>
+__device__ inline int smem_b_index_k64_e4m3(int col, int kk) {
+  return (kk & 15) + col * 16 + ((kk >> 4) * (BlockN * 16));
+}
+
+template <int BlockN, typename Element>
+__device__ inline int raw_smem_b_index(int col, int kk) {
+  if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
+    return smem_b_index_k64_e4m3<BlockN>(col, kk);
+  } else {
+    return smem_b_index<BlockN>(col, kk);
+  }
 }
 
 __device__ inline int smem_e_index(int row, int byte_col) {
   return (byte_col & 1) + ((byte_col >> 1) * 32) + ((row >> 4) * 64) + ((row & 7) * 4) + (((row >> 3) & 1) * 2);
 }
 
+__device__ inline int smem_e_index_k64(int row, int byte_col) {
+  return (byte_col & 1) + ((byte_col >> 1) * 32) + ((row >> 4) * 128) + ((row & 7) * 4) + (((row >> 3) & 1) * 2);
+}
+
+__device__ inline int smem_e_index_k64_e4m3(int row, int byte_col) {
+  return row * 8 + byte_col;
+}
+
 __device__ inline int e_thread_byte_offset(int tid) {
   return ((tid & 1) * 32) + ((tid >> 5) * 64) + (((tid >> 2) & 7) * 4);
 }
 
-template <int BlockN>
+__device__ inline int e_thread_byte_offset_k64(int tid) {
+  return ((tid & 3) * 32) + ((tid >> 5) * 128) + (((tid >> 2) & 7) * 4);
+}
+
+template <typename Element>
+__device__ inline int raw_smem_e_index(int row, int byte_col) {
+  if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
+    return smem_e_index_k64_e4m3(row, byte_col);
+  } else if constexpr (RawSparseConfig<Element>::kBlockK == 64) {
+    return smem_e_index_k64(row, byte_col);
+  } else {
+    return smem_e_index(row, byte_col);
+  }
+}
+
+template <typename Element>
+__device__ inline int raw_e_thread_byte_offset(int tid) {
+  if constexpr (RawSparseConfig<Element>::kBlockK == 64) {
+    return e_thread_byte_offset_k64(tid);
+  } else {
+    return e_thread_byte_offset(tid);
+  }
+}
+
+template <int BlockN, typename Element>
 struct BDescParams {
-  static constexpr uint32_t kLeading = BlockN >= 64 ? 64 : BlockN;
+  static constexpr uint32_t kLeading = BlockN;
+  static constexpr uint32_t kStride = BlockN == 8 ? 0u : 8u;
+};
+
+template <int BlockN>
+struct BDescParams<BlockN, __nv_fp8_e4m3> {
+  static constexpr uint32_t kLeading = BlockN;
   static constexpr uint32_t kStride = BlockN == 8 ? 0u : 8u;
 };
 
 template <int BlockN, typename Element>
+__device__ inline uint32_t raw_metadata_u32(
+    uint8_t const* e_bytes,
+    uint8_t* smem_e,
+    int block_row,
+    int k_tile,
+    int k,
+    int tid) {
+  (void)e_bytes;
+  (void)block_row;
+  (void)k_tile;
+  (void)k;
+  if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
+    return raw_fp8_metadata_u32<BlockN>(smem_e, tid);
+  } else {
+    return ld_shared_u32(smem_e + raw_e_thread_byte_offset<Element>(tid));
+  }
+}
+
+template <int BlockN, typename Element>
 struct RawSparseWgmma;
+
+#define RAW_OUT_FLOATS_32                                                     \
+  "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),                    \
+      "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),                \
+      "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),              \
+      "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),            \
+      "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),            \
+      "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),            \
+      "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),            \
+      "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+
+#define RAW_OUT_FLOATS_64                                                     \
+  RAW_OUT_FLOATS_32, "+f"(d[32]), "+f"(d[33]), "+f"(d[34]),          \
+      "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]),            \
+      "+f"(d[39]), "+f"(d[40]), "+f"(d[41]), "+f"(d[42]),            \
+      "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]),            \
+      "+f"(d[47]), "+f"(d[48]), "+f"(d[49]), "+f"(d[50]),            \
+      "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]),            \
+      "+f"(d[55]), "+f"(d[56]), "+f"(d[57]), "+f"(d[58]),            \
+      "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),            \
+      "+f"(d[63])
+
+#define RAW_OUT_FLOATS_128                                                    \
+  RAW_OUT_FLOATS_64, "+f"(d[64]), "+f"(d[65]), "+f"(d[66]),          \
+      "+f"(d[67]), "+f"(d[68]), "+f"(d[69]), "+f"(d[70]),            \
+      "+f"(d[71]), "+f"(d[72]), "+f"(d[73]), "+f"(d[74]),            \
+      "+f"(d[75]), "+f"(d[76]), "+f"(d[77]), "+f"(d[78]),            \
+      "+f"(d[79]), "+f"(d[80]), "+f"(d[81]), "+f"(d[82]),            \
+      "+f"(d[83]), "+f"(d[84]), "+f"(d[85]), "+f"(d[86]),            \
+      "+f"(d[87]), "+f"(d[88]), "+f"(d[89]), "+f"(d[90]),            \
+      "+f"(d[91]), "+f"(d[92]), "+f"(d[93]), "+f"(d[94]),            \
+      "+f"(d[95]), "+f"(d[96]), "+f"(d[97]), "+f"(d[98]),            \
+      "+f"(d[99]), "+f"(d[100]), "+f"(d[101]), "+f"(d[102]),         \
+      "+f"(d[103]), "+f"(d[104]), "+f"(d[105]), "+f"(d[106]),        \
+      "+f"(d[107]), "+f"(d[108]), "+f"(d[109]), "+f"(d[110]),        \
+      "+f"(d[111]), "+f"(d[112]), "+f"(d[113]), "+f"(d[114]),        \
+      "+f"(d[115]), "+f"(d[116]), "+f"(d[117]), "+f"(d[118]),        \
+      "+f"(d[119]), "+f"(d[120]), "+f"(d[121]), "+f"(d[122]),        \
+      "+f"(d[123]), "+f"(d[124]), "+f"(d[125]), "+f"(d[126]),        \
+      "+f"(d[127])
 
 template <>
 struct RawSparseWgmma<8, half> {
@@ -435,6 +714,82 @@ struct RawSparseWgmma<32, half> {
           "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
           "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
           "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+  }
+};
+
+template <>
+struct RawSparseWgmma<64, half> {
+  static constexpr int kAccRegs = 32;
+
+  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %36, 0;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n64k32.f32.f16.f16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, %34, %35, p, %37, %38, %39, %40;\n"
+        "}\n"
+        : RAW_OUT_FLOATS_32
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+  }
+};
+
+template <>
+struct RawSparseWgmma<128, half> {
+  static constexpr int kAccRegs = 64;
+
+  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %68, 0;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n128k32.f32.f16.f16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, "
+        "%40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, "
+        "%56, %57, %58, %59, %60, %61, %62, %63}, %64, %65, %66, %67, p, %69, %70, %71, %72;\n"
+        "}\n"
+        : RAW_OUT_FLOATS_64
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+  }
+};
+
+template <>
+struct RawSparseWgmma<256, half> {
+  static constexpr int kAccRegs = 128;
+
+  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %132, 0;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n256k32.f32.f16.f16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, "
+        "%40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, "
+        "%56, %57, %58, %59, %60, %61, %62, %63, "
+        "%64, %65, %66, %67, %68, %69, %70, %71, "
+        "%72, %73, %74, %75, %76, %77, %78, %79, "
+        "%80, %81, %82, %83, %84, %85, %86, %87, "
+        "%88, %89, %90, %91, %92, %93, %94, %95, "
+        "%96, %97, %98, %99, %100, %101, %102, %103, "
+        "%104, %105, %106, %107, %108, %109, %110, %111, "
+        "%112, %113, %114, %115, %116, %117, %118, %119, "
+        "%120, %121, %122, %123, %124, %125, %126, %127}, %128, %129, %130, %131, p, %133, %134, %135, %136;\n"
+        "}\n"
+        : RAW_OUT_FLOATS_128
         : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
   }
 };
@@ -495,6 +850,82 @@ struct RawSparseWgmma<32, __nv_bfloat16> {
 };
 
 template <>
+struct RawSparseWgmma<64, __nv_bfloat16> {
+  static constexpr int kAccRegs = 32;
+
+  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %36, 0;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n64k32.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, %34, %35, p, %37, %38, %39, %40;\n"
+        "}\n"
+        : RAW_OUT_FLOATS_32
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+  }
+};
+
+template <>
+struct RawSparseWgmma<128, __nv_bfloat16> {
+  static constexpr int kAccRegs = 64;
+
+  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %68, 0;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n128k32.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, "
+        "%40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, "
+        "%56, %57, %58, %59, %60, %61, %62, %63}, %64, %65, %66, %67, p, %69, %70, %71, %72;\n"
+        "}\n"
+        : RAW_OUT_FLOATS_64
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+  }
+};
+
+template <>
+struct RawSparseWgmma<256, __nv_bfloat16> {
+  static constexpr int kAccRegs = 128;
+
+  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %132, 0;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n256k32.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, "
+        "%40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, "
+        "%56, %57, %58, %59, %60, %61, %62, %63, "
+        "%64, %65, %66, %67, %68, %69, %70, %71, "
+        "%72, %73, %74, %75, %76, %77, %78, %79, "
+        "%80, %81, %82, %83, %84, %85, %86, %87, "
+        "%88, %89, %90, %91, %92, %93, %94, %95, "
+        "%96, %97, %98, %99, %100, %101, %102, %103, "
+        "%104, %105, %106, %107, %108, %109, %110, %111, "
+        "%112, %113, %114, %115, %116, %117, %118, %119, "
+        "%120, %121, %122, %123, %124, %125, %126, %127}, %128, %129, %130, %131, p, %133, %134, %135, %136;\n"
+        "}\n"
+        : RAW_OUT_FLOATS_128
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+  }
+};
+
+template <>
 struct RawSparseWgmma<8, __nv_fp8_e4m3> {
   static constexpr int kAccRegs = 4;
 
@@ -503,11 +934,11 @@ struct RawSparseWgmma<8, __nv_fp8_e4m3> {
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %8, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
-        "{%0, %1, %2, %3}, %4, %5, %6, %7, p, %9, %10, %11, %12;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n8k64.f32.e4m3.e4m3 "
+        "{%0, %1, %2, %3}, %4, %5, %6, %7, p, %9, %10;\n"
         "}\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1));
   }
 };
 
@@ -520,12 +951,12 @@ struct RawSparseWgmma<16, __nv_fp8_e4m3> {
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %12, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n16k32.f32.e4m3.e4m3 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, %10, %11, p, %13, %14, %15, %16;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n16k64.f32.e4m3.e4m3 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, %10, %11, p, %13, %14;\n"
         "}\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
           "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1));
   }
 };
 
@@ -538,600 +969,96 @@ struct RawSparseWgmma<32, __nv_fp8_e4m3> {
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %20, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %21, %22, %23, %24;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n32k64.f32.e4m3.e4m3 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %21, %22;\n"
         "}\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
           "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
           "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
           "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1));
   }
 };
 
 template <>
-struct RawSparseWgmma<8, __nv_fp8_e5m2> {
-  static constexpr int kAccRegs = 4;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %8, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n8k32.f32.e5m2.e5m2 "
-        "{%0, %1, %2, %3}, %4, %5, %6, %7, p, %9, %10, %11, %12;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmma<16, __nv_fp8_e5m2> {
-  static constexpr int kAccRegs = 8;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %12, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n16k32.f32.e5m2.e5m2 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7}, %8, %9, %10, %11, p, %13, %14, %15, %16;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmma<32, __nv_fp8_e5m2> {
-  static constexpr int kAccRegs = 16;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %20, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %21, %22, %23, %24;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <int Ntiles, typename Element>
-struct RawSparseWgmmaTiled;
-
-template <typename Element>
-struct RawSparseWgmmaTiled<2, Element> {
+struct RawSparseWgmma<64, __nv_fp8_e4m3> {
   static constexpr int kAccRegs = 32;
-  static constexpr int kTileN = 32;
 
   __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
     asm volatile(
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %36, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %37, %38, %39, %40;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %37, %38, %39, %40;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n64k64.f32.e4m3.e4m3 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, %34, %35, p, %37, %38;\n"
         "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+        : RAW_OUT_FLOATS_32
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1));
   }
 };
 
 template <>
-struct RawSparseWgmmaTiled<2, __nv_bfloat16> {
-  static constexpr int kAccRegs = 32;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %36, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %37, %38, %39, %40;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %37, %38, %39, %40;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <typename Element>
-struct RawSparseWgmmaTiled<4, Element> {
+struct RawSparseWgmma<128, __nv_fp8_e4m3> {
   static constexpr int kAccRegs = 64;
-  static constexpr int kTileN = 32;
 
   __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
     asm volatile(
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %68, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %69, %70, %71, %72;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n128k64.f32.e4m3.e4m3 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, "
+        "%40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, "
+        "%56, %57, %58, %59, %60, %61, %62, %63}, %64, %65, %66, %67, p, %69, %70;\n"
         "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+        : RAW_OUT_FLOATS_64
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1));
   }
 };
 
 template <>
-struct RawSparseWgmmaTiled<4, __nv_bfloat16> {
-  static constexpr int kAccRegs = 64;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %68, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %69, %70, %71, %72;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <typename Element>
-struct RawSparseWgmmaTiled<8, Element> {
+struct RawSparseWgmma<256, __nv_fp8_e4m3> {
   static constexpr int kAccRegs = 128;
-  static constexpr int kTileN = 32;
 
   __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
     asm volatile(
         "{\n"
         "  .reg .pred p;\n"
         "  setp.ne.b32 p, %132, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79}, %16, %80, %81, %82, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95}, %16, %96, %97, %98, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111}, %16, %112, %113, %114, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.f16.f16 "
-        "{%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, %16, %128, %129, %130, p, %133, %134, %135, %136;\n"
+        "  wgmma.mma_async.sp.sync.aligned.m64n256k64.f32.e4m3.e4m3 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7, "
+        "%8, %9, %10, %11, %12, %13, %14, %15, "
+        "%16, %17, %18, %19, %20, %21, %22, %23, "
+        "%24, %25, %26, %27, %28, %29, %30, %31, "
+        "%32, %33, %34, %35, %36, %37, %38, %39, "
+        "%40, %41, %42, %43, %44, %45, %46, %47, "
+        "%48, %49, %50, %51, %52, %53, %54, %55, "
+        "%56, %57, %58, %59, %60, %61, %62, %63, "
+        "%64, %65, %66, %67, %68, %69, %70, %71, "
+        "%72, %73, %74, %75, %76, %77, %78, %79, "
+        "%80, %81, %82, %83, %84, %85, %86, %87, "
+        "%88, %89, %90, %91, %92, %93, %94, %95, "
+        "%96, %97, %98, %99, %100, %101, %102, %103, "
+        "%104, %105, %106, %107, %108, %109, %110, %111, "
+        "%112, %113, %114, %115, %116, %117, %118, %119, "
+        "%120, %121, %122, %123, %124, %125, %126, %127}, %128, %129, %130, %131, p, %133, %134;\n"
         "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),
-          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]),
-          "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),
-          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]),
-          "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),
-          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
-          "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),
-          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]),
-          "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]),
-          "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]),
-          "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
-          "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]),
-          "+f"(d[108]), "+f"(d[109]), "+f"(d[110]), "+f"(d[111]),
-          "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
-          "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]),
-          "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]),
-          "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
+        : RAW_OUT_FLOATS_128
+        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1));
   }
 };
 
-template <>
-struct RawSparseWgmmaTiled<8, __nv_bfloat16> {
-  static constexpr int kAccRegs = 128;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %132, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79}, %16, %80, %81, %82, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95}, %16, %96, %97, %98, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111}, %16, %112, %113, %114, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.bf16.bf16 "
-        "{%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, %16, %128, %129, %130, p, %133, %134, %135, %136;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),
-          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]),
-          "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),
-          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]),
-          "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),
-          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
-          "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),
-          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]),
-          "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]),
-          "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]),
-          "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
-          "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]),
-          "+f"(d[108]), "+f"(d[109]), "+f"(d[110]), "+f"(d[111]),
-          "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
-          "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]),
-          "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]),
-          "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmmaTiled<2, __nv_fp8_e4m3> {
-  static constexpr int kAccRegs = 32;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %36, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %37, %38, %39, %40;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %37, %38, %39, %40;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmmaTiled<4, __nv_fp8_e4m3> {
-  static constexpr int kAccRegs = 64;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %68, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %69, %70, %71, %72;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmmaTiled<8, __nv_fp8_e4m3> {
-  static constexpr int kAccRegs = 128;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %132, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79}, %16, %80, %81, %82, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95}, %16, %96, %97, %98, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111}, %16, %112, %113, %114, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e4m3.e4m3 "
-        "{%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, %16, %128, %129, %130, p, %133, %134, %135, %136;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),
-          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]),
-          "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),
-          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]),
-          "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),
-          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
-          "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),
-          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]),
-          "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]),
-          "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]),
-          "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
-          "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]),
-          "+f"(d[108]), "+f"(d[109]), "+f"(d[110]), "+f"(d[111]),
-          "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
-          "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]),
-          "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]),
-          "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmmaTiled<2, __nv_fp8_e5m2> {
-  static constexpr int kAccRegs = 32;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %36, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %37, %38, %39, %40;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %37, %38, %39, %40;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmmaTiled<4, __nv_fp8_e5m2> {
-  static constexpr int kAccRegs = 64;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %68, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %69, %70, %71, %72;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %69, %70, %71, %72;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <>
-struct RawSparseWgmmaTiled<8, __nv_fp8_e5m2> {
-  static constexpr int kAccRegs = 128;
-  static constexpr int kTileN = 32;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    asm volatile(
-        "{\n"
-        "  .reg .pred p;\n"
-        "  setp.ne.b32 p, %132, 0;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, %16, %17, %18, %19, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %16, %32, %33, %34, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47}, %16, %48, %49, %50, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %16, %64, %65, %66, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%64, %65, %66, %67, %68, %69, %70, %71, %72, %73, %74, %75, %76, %77, %78, %79}, %16, %80, %81, %82, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%80, %81, %82, %83, %84, %85, %86, %87, %88, %89, %90, %91, %92, %93, %94, %95}, %16, %96, %97, %98, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%96, %97, %98, %99, %100, %101, %102, %103, %104, %105, %106, %107, %108, %109, %110, %111}, %16, %112, %113, %114, p, %133, %134, %135, %136;\n"
-        "  wgmma.mma_async.sp.sync.aligned.m64n32k32.f32.e5m2.e5m2 "
-        "{%112, %113, %114, %115, %116, %117, %118, %119, %120, %121, %122, %123, %124, %125, %126, %127}, %16, %128, %129, %130, p, %133, %134, %135, %136;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-          "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-          "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-          "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-          "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-          "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-          "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-          "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-          "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]),
-          "+f"(d[64]), "+f"(d[65]), "+f"(d[66]), "+f"(d[67]),
-          "+f"(d[68]), "+f"(d[69]), "+f"(d[70]), "+f"(d[71]),
-          "+f"(d[72]), "+f"(d[73]), "+f"(d[74]), "+f"(d[75]),
-          "+f"(d[76]), "+f"(d[77]), "+f"(d[78]), "+f"(d[79]),
-          "+f"(d[80]), "+f"(d[81]), "+f"(d[82]), "+f"(d[83]),
-          "+f"(d[84]), "+f"(d[85]), "+f"(d[86]), "+f"(d[87]),
-          "+f"(d[88]), "+f"(d[89]), "+f"(d[90]), "+f"(d[91]),
-          "+f"(d[92]), "+f"(d[93]), "+f"(d[94]), "+f"(d[95]),
-          "+f"(d[96]), "+f"(d[97]), "+f"(d[98]), "+f"(d[99]),
-          "+f"(d[100]), "+f"(d[101]), "+f"(d[102]), "+f"(d[103]),
-          "+f"(d[104]), "+f"(d[105]), "+f"(d[106]), "+f"(d[107]),
-          "+f"(d[108]), "+f"(d[109]), "+f"(d[110]), "+f"(d[111]),
-          "+f"(d[112]), "+f"(d[113]), "+f"(d[114]), "+f"(d[115]),
-          "+f"(d[116]), "+f"(d[117]), "+f"(d[118]), "+f"(d[119]),
-          "+f"(d[120]), "+f"(d[121]), "+f"(d[122]), "+f"(d[123]),
-          "+f"(d[124]), "+f"(d[125]), "+f"(d[126]), "+f"(d[127])
-        : "l"(desc_a), "l"(desc_b), "r"(e), "n"(0), "r"(scale_d), "n"(1), "n"(1), "n"(0), "n"(1));
-  }
-};
-
-template <int BlockN, typename Element>
-struct RawSparseWgmma {
-  static constexpr int kNTiles = BlockN / 32;
-  static constexpr int kAccRegs = RawSparseWgmmaTiled<kNTiles, Element>::kAccRegs;
-
-  __device__ static void fma(uint64_t desc_a, uint64_t desc_b, float* d, uint32_t e, int scale_d) {
-    RawSparseWgmmaTiled<kNTiles, Element>::fma(desc_a, desc_b, d, e, scale_d);
-  }
-};
+#undef RAW_OUT_FLOATS_128
+#undef RAW_OUT_FLOATS_64
+#undef RAW_OUT_FLOATS_32
 
 template <int BlockN>
 __device__ inline void store_accum(float const* accum, float* c, int n, int block_row, int block_col, int tid) {
@@ -1160,12 +1087,21 @@ __global__ void wgmma_sp_raw_kernel(
   __shared__ RawSharedStorage<BlockN, Element> shared;
 
   constexpr int kAccRegs = RawSparseWgmma<BlockN, Element>::kAccRegs;
-  constexpr int kNTiles = BlockN / 32;
+  constexpr int kBlockK = RawSparseConfig<Element>::kBlockK;
+  constexpr int kSparseK = RawSparseConfig<Element>::kSparseK;
+  constexpr int kMetaBytes = RawSparseConfig<Element>::kMetaBytes;
   int tid = threadIdx.x;
   int block_row = blockIdx.y * kRawBlockM;
   int block_col = blockIdx.x * BlockN;
 
-  uint64_t desc_a = make_gmma_desc(smem_ptr_as_uint(shared.smem_A), 64, 8);
+  uint64_t desc_a = make_gmma_desc(
+      smem_ptr_as_uint(shared.smem_A),
+      RawSparseConfig<Element>::kADescLeading,
+      RawSparseConfig<Element>::kADescStride);
+  uint64_t desc_b = make_gmma_desc(
+      smem_ptr_as_uint(shared.smem_B),
+      BDescParams<BlockN, Element>::kLeading,
+      BDescParams<BlockN, Element>::kStride);
 
   float accum[kAccRegs];
 #pragma unroll
@@ -1173,58 +1109,44 @@ __global__ void wgmma_sp_raw_kernel(
     accum[i] = 0.0f;
   }
 
+  auto sE = raw_fp8_smem_e_tensor(shared.smem_E);
+  auto sEraw = cute::recast<uint8_t>(sE);
+
   bool first_k_tile = true;
-  for (int k_tile = 0; k_tile < k; k_tile += kRawBlockK) {
-    for (int idx = tid; idx < kRawBlockM * kRawSparseK; idx += kRawThreads) {
-      int row = idx / kRawSparseK;
-      int col = idx % kRawSparseK;
-      shared.smem_A[smem_a_index(row, col)] = a_sparse[(block_row + row) * (k / 2) + (k_tile / 2) + col];
+  for (int k_tile = 0; k_tile < k; k_tile += kBlockK) {
+    for (int idx = tid; idx < kRawBlockM * kSparseK; idx += kRawThreads) {
+      int row = idx / kSparseK;
+      int col = idx % kSparseK;
+      shared.smem_A[raw_smem_a_index<Element>(row, col)] =
+          a_sparse[(block_row + row) * (k / 2) + (k_tile / 2) + col];
     }
 
-    for (int idx = tid; idx < BlockN * kRawBlockK; idx += kRawThreads) {
-      int col = idx / kRawBlockK;
-      int kk = idx % kRawBlockK;
-      shared.smem_B[smem_b_index<BlockN>(col, kk)] = b[(k_tile + kk) * n + (block_col + col)];
+    for (int idx = tid; idx < BlockN * kBlockK; idx += kRawThreads) {
+      int col = idx / kBlockK;
+      int kk = idx % kBlockK;
+      shared.smem_B[raw_smem_b_index<BlockN, Element>(col, kk)] =
+          b[(k_tile + kk) * n + (block_col + col)];
     }
 
-    for (int idx = tid; idx < kRawBlockM * kRawMetaBytes; idx += kRawThreads) {
-      int row = idx / kRawMetaBytes;
-      int byte_col = idx % kRawMetaBytes;
-      shared.smem_E[smem_e_index(row, byte_col)] = e_bytes[(block_row + row) * (k / 8) + (k_tile / 8) + byte_col];
+    for (int idx = tid; idx < kRawBlockM * kMetaBytes; idx += kRawThreads) {
+      int row = idx / kMetaBytes;
+      int byte_col = idx % kMetaBytes;
+      if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
+        sEraw(row, byte_col) = e_bytes[(block_row + row) * (k / 8) + (k_tile / 8) + byte_col];
+      } else {
+        shared.smem_E[raw_smem_e_index<Element>(row, byte_col)] =
+            e_bytes[(block_row + row) * (k / 8) + (k_tile / 8) + byte_col];
+      }
     }
 
     __syncthreads();
 
-    uint32_t e = ld_shared_u32(shared.smem_E + e_thread_byte_offset(tid));
+    uint32_t e = raw_metadata_u32<BlockN, Element>(e_bytes, shared.smem_E, block_row, k_tile, k, tid);
     int scale_d = first_k_tile ? 0 : 1;
 
     warpgroup_fence_accum(accum);
     warpgroup_arrive();
-    
-    if constexpr (kNTiles == 1) {
-      uint64_t desc_b = make_gmma_desc(smem_ptr_as_uint(shared.smem_B), BDescParams<BlockN>::kLeading, BDescParams<BlockN>::kStride);
-      RawSparseWgmma<BlockN, Element>::fma(desc_a, desc_b, accum, e, scale_d);
-    } else {
-      constexpr int kTileRegs = 16;
-      float tile_accum[kTileRegs];
-#pragma unroll
-      for (int i = 0; i < kTileRegs; ++i) {
-        tile_accum[i] = 0.0f;
-      }
-      
-#pragma unroll
-      for (int tile = 0; tile < kNTiles; ++tile) {
-        int tile_col_offset = tile * 32;
-        uint64_t desc_b = make_gmma_desc(smem_ptr_as_uint(shared.smem_B + tile_col_offset * kRawBlockK), 32, 8);
-        RawSparseWgmma<32, Element>::fma(desc_a, desc_b, tile_accum, e, tile == 0 ? scale_d : 1);
-        
-#pragma unroll
-        for (int i = 0; i < kTileRegs; ++i) {
-          accum[tile * kTileRegs + i] += tile_accum[i];
-        }
-      }
-    }
-    
+    RawSparseWgmma<BlockN, Element>::fma(desc_a, desc_b, accum, e, scale_d);
     warpgroup_commit_batch();
     warpgroup_wait<0>();
     warpgroup_fence_accum(accum);
@@ -1246,8 +1168,9 @@ struct RawWgmmaSparseDemo {
       int k,
       bool use_pattern,
       std::mt19937& gen) {
-    if ((m % kRawBlockM) != 0 || (n % BlockN) != 0 || (k % kRawBlockK) != 0) {
-      std::cerr << tag << " requires M%64==0, N%" << BlockN << "==0, K%32==0" << std::endl;
+    constexpr int kBlockK = RawSparseConfig<Element>::kBlockK;
+    if ((m % kRawBlockM) != 0 || (n % BlockN) != 0 || (k % kBlockK) != 0) {
+      std::cerr << tag << " requires M%64==0, N%" << BlockN << "==0, K%" << kBlockK << "==0" << std::endl;
       return false;
     }
 
