@@ -5,9 +5,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include <cute/atom/mma_traits_sm90_gmma_sparse.hpp>
-#include <cute/tensor.hpp>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -295,141 +292,7 @@ inline int select_best_device() {
 
 constexpr int kRawBlockM = 64;
 constexpr int kRawThreads = 128;
-
-using RawFp8MetadataElementEMma = cute::sparse_elem<8, uint8_t>;
-using RawFp8MetadataTensorEAtom = decltype(cute::make_ordered_layout(
-    cute::Shape<cute::Shape<cute::_8, cute::_2, cute::_4>, cute::Shape<cute::_32, cute::_2, cute::Int<1>>>{},
-    cute::Step<cute::Step<cute::_3, cute::_1, cute::_6>, cute::Step<cute::_0, cute::_5, cute::_2>>{}));
-using RawFp8MetadataSmemLayoutAtomE = cute::ComposedLayout<
-    cute::Swizzle<0, 4, 3>,
-    cute::smem_sparse_ptr_flag_bits<RawFp8MetadataElementEMma::sparsity, cute::sizeof_bits_v<uint8_t>>,
-    RawFp8MetadataTensorEAtom>;
-using RawFp8MetadataSmemLayoutE = decltype(cute::tile_to_shape(
-    RawFp8MetadataSmemLayoutAtomE{},
-    cute::Shape<cute::_64, cute::_64>{}));
-constexpr int kRawFp8MetadataSmemBytes = cute::cosize_v<RawFp8MetadataSmemLayoutE>;
-
-template <class MMAAtom, class AtomLayoutMNK, class PermutationMNK, class ETensor>
-CUTE_HOST_DEVICE constexpr auto raw_thrfrg_e(
-    cute::TiledMMA<MMAAtom, AtomLayoutMNK, PermutationMNK> const& mma,
-    ETensor&& etensor) {
-  using TMma = cute::TiledMMA<MMAAtom, AtomLayoutMNK, PermutationMNK>;
-
-  auto t_tile = cute::make_tile(cute::get<0>(PermutationMNK{}), cute::get<2>(PermutationMNK{}));
-  auto t_tensor = cute::logical_divide(etensor, t_tile);
-
-  auto e_tile = cute::make_tile(
-      cute::make_layout(cute::size<0>(typename TMma::AtomShape_MNK{})),
-      cute::make_layout(cute::size<2>(typename TMma::AtomShape_MNK{})));
-  auto e_tensor = cute::zipped_divide(t_tensor, e_tile);
-
-  using AtomLayoutE_TV = typename TMma::Atom::Traits::ELayout;
-  auto tv_tensor = e_tensor.compose(AtomLayoutE_TV{}, cute::_);
-
-  auto thr_tile = cute::make_tile(
-      cute::_,
-      cute::make_tile(
-          cute::make_layout(cute::size<1>(mma.thr_layout_vmnk_)),
-          cute::make_layout(cute::size<3>(mma.thr_layout_vmnk_))));
-  return cute::zipped_divide(tv_tensor, thr_tile);
-}
-
-template <class... MArgs>
-CUTE_HOST_DEVICE constexpr auto raw_get_layout_e_tv(cute::TiledMMA<MArgs...> const& mma) {
-  auto ref_e = cute::make_layout(cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<2>(mma)));
-  auto layout_e_tv = raw_thrfrg_e(mma, ref_e);
-
-  auto etile = cute::make_tile(
-      cute::_,
-      cute::make_tile(
-          cute::make_layout(
-              cute::make_shape(cute::size<1>(mma.thr_layout_vmnk_), cute::size<2>(mma.thr_layout_vmnk_)),
-              cute::make_stride(cute::Int<1>{}, cute::Int<0>{})),
-          cute::_));
-
-  auto thridx_to_thrid = cute::right_inverse(mma.thr_layout_vmnk_);
-  return layout_e_tv.compose(etile, cute::_).compose(thridx_to_thrid, cute::_);
-}
-
-template <class... MArgs, class ETensor>
-CUTE_HOST_DEVICE constexpr auto raw_partition_e(cute::ThrMMA<MArgs...> const& thr_mma, ETensor&& etensor) {
-  auto thr_tensor = cute::make_tensor(static_cast<ETensor&&>(etensor).data(), raw_thrfrg_e(thr_mma, etensor.layout()));
-  auto thr_vmk = cute::make_coord(
-      cute::get<0>(thr_mma.thr_vmnk_),
-      cute::make_coord(cute::get<1>(thr_mma.thr_vmnk_), cute::get<3>(thr_mma.thr_vmnk_)));
-  return thr_tensor(thr_vmk, cute::make_coord(cute::_, cute::repeat<cute::rank<1, 1>(thr_tensor)>(cute::_)));
-}
-
-template <class... CArgs, class... MArgs>
-CUTE_HOST_DEVICE constexpr auto raw_make_tiled_copy_e(
-    cute::Copy_Atom<CArgs...> const& copy_atom,
-    cute::TiledMMA<MArgs...> const& mma) {
-  return cute::make_tiled_copy_impl(
-      copy_atom,
-      raw_get_layout_e_tv(mma),
-      cute::make_shape(cute::tile_size<0>(mma), cute::tile_size<2>(mma)));
-}
-
-__device__ inline auto raw_fp8_smem_e_tensor(uint8_t* smem_e) {
-  return cute::make_tensor(
-      cute::make_smem_ptr(cute::recast_ptr<RawFp8MetadataElementEMma>(smem_e)),
-      RawFp8MetadataSmemLayoutE{});
-}
-
-template <int BlockN>
-struct RawFp8MetadataMmaOp;
-
-template <>
-struct RawFp8MetadataMmaOp<8> {
-  using type = cute::SM90::GMMA::SPARSE::GMMA_64x8x64_F32E4M3E4M3_SS_TN<>;
-};
-
-template <>
-struct RawFp8MetadataMmaOp<16> {
-  using type = cute::SM90::GMMA::SPARSE::GMMA_64x16x64_F32E4M3E4M3_SS_TN<>;
-};
-
-template <>
-struct RawFp8MetadataMmaOp<32> {
-  using type = cute::SM90::GMMA::SPARSE::GMMA_64x32x64_F32E4M3E4M3_SS_TN<>;
-};
-
-template <>
-struct RawFp8MetadataMmaOp<64> {
-  using type = cute::SM90::GMMA::SPARSE::GMMA_64x64x64_F32E4M3E4M3_SS_TN<>;
-};
-
-template <>
-struct RawFp8MetadataMmaOp<128> {
-  using type = cute::SM90::GMMA::SPARSE::GMMA_64x128x64_F32E4M3E4M3_SS_TN<>;
-};
-
-template <>
-struct RawFp8MetadataMmaOp<256> {
-  using type = cute::SM90::GMMA::SPARSE::GMMA_64x256x64_F32E4M3E4M3_SS_TN<>;
-};
-
-template <int BlockN>
-__device__ inline uint32_t raw_fp8_metadata_u32(uint8_t* smem_e, int tid) {
-  using MmaOp = typename RawFp8MetadataMmaOp<BlockN>::type;
-  using TiledMma = decltype(cute::make_tiled_mma(MmaOp{}));
-
-  auto sE = raw_fp8_smem_e_tensor(smem_e);
-  TiledMma tiled_mma;
-  auto thread_mma = tiled_mma.get_thread_slice(tid);
-  auto tCsE = raw_partition_e(thread_mma, sE);
-  auto tCrE = cute::make_fragment_like<RawFp8MetadataElementEMma>(tCsE);
-
-  auto copy_atom_e = cute::Copy_Atom<cute::AutoVectorizingCopy, uint32_t>{};
-  auto smem_tiled_copy_e = raw_make_tiled_copy_e(copy_atom_e, tiled_mma);
-  auto smem_thr_copy_e = smem_tiled_copy_e.get_thread_slice(tid);
-  auto tEsE = smem_thr_copy_e.partition_S(sE);
-  auto tErE = smem_thr_copy_e.retile_D(tCrE);
-  cute::copy(smem_tiled_copy_e, tEsE, tErE);
-
-  auto rE = cute::recast<uint32_t>(tCrE);
-  return rE[0];
-}
+constexpr int kRawFp8MetadataSmemBytes = kRawBlockM * 8;
 
 template <typename Element>
 struct RawSparseConfig;
@@ -558,7 +421,13 @@ __device__ inline int smem_e_index_k64(int row, int byte_col) {
 }
 
 __device__ inline int smem_e_index_k64_e4m3(int row, int byte_col) {
-  return row * 8 + byte_col;
+  int row_block = row >> 4;
+  int row_in_block = row & 15;
+  int row_lo = row_in_block & 7;
+  int row_hi = row_in_block >> 3;
+  int col_group = byte_col >> 2;
+  int col_lo = byte_col & 3;
+  return row_block * 128 + col_group * 64 + row_lo * 8 + row_hi * 4 + col_lo;
 }
 
 __device__ inline int e_thread_byte_offset(int tid) {
@@ -567,6 +436,12 @@ __device__ inline int e_thread_byte_offset(int tid) {
 
 __device__ inline int e_thread_byte_offset_k64(int tid) {
   return ((tid & 3) * 32) + ((tid >> 5) * 128) + (((tid >> 2) & 7) * 4);
+}
+
+__device__ inline int e_thread_byte_offset_k64_e4m3(int tid) {
+  int row = ((tid >> 2) & 7) + ((tid & 1) << 3) + ((tid >> 5) << 4);
+  int byte_col = ((tid >> 1) & 1) << 2;
+  return smem_e_index_k64_e4m3(row, byte_col);
 }
 
 template <typename Element>
@@ -582,7 +457,9 @@ __device__ inline int raw_smem_e_index(int row, int byte_col) {
 
 template <typename Element>
 __device__ inline int raw_e_thread_byte_offset(int tid) {
-  if constexpr (RawSparseConfig<Element>::kBlockK == 64) {
+  if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
+    return e_thread_byte_offset_k64_e4m3(tid);
+  } else if constexpr (RawSparseConfig<Element>::kBlockK == 64) {
     return e_thread_byte_offset_k64(tid);
   } else {
     return e_thread_byte_offset(tid);
@@ -614,7 +491,7 @@ __device__ inline uint32_t raw_metadata_u32(
   (void)k_tile;
   (void)k;
   if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
-    return raw_fp8_metadata_u32<BlockN>(smem_e, tid);
+    return ld_shared_u32(smem_e + raw_e_thread_byte_offset<Element>(tid));
   } else {
     return ld_shared_u32(smem_e + raw_e_thread_byte_offset<Element>(tid));
   }
@@ -1109,9 +986,6 @@ __global__ void wgmma_sp_raw_kernel(
     accum[i] = 0.0f;
   }
 
-  auto sE = raw_fp8_smem_e_tensor(shared.smem_E);
-  auto sEraw = cute::recast<uint8_t>(sE);
-
   bool first_k_tile = true;
   for (int k_tile = 0; k_tile < k; k_tile += kBlockK) {
     for (int idx = tid; idx < kRawBlockM * kSparseK; idx += kRawThreads) {
@@ -1131,12 +1005,8 @@ __global__ void wgmma_sp_raw_kernel(
     for (int idx = tid; idx < kRawBlockM * kMetaBytes; idx += kRawThreads) {
       int row = idx / kMetaBytes;
       int byte_col = idx % kMetaBytes;
-      if constexpr (std::is_same_v<Element, __nv_fp8_e4m3>) {
-        sEraw(row, byte_col) = e_bytes[(block_row + row) * (k / 8) + (k_tile / 8) + byte_col];
-      } else {
-        shared.smem_E[raw_smem_e_index<Element>(row, byte_col)] =
-            e_bytes[(block_row + row) * (k / 8) + (k_tile / 8) + byte_col];
-      }
+      shared.smem_E[raw_smem_e_index<Element>(row, byte_col)] =
+          e_bytes[(block_row + row) * (k / 8) + (k_tile / 8) + byte_col];
     }
 
     __syncthreads();

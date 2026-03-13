@@ -87,7 +87,7 @@ The key line was this:
 using MmaOp = cute::SM90::GMMA::SPARSE::GMMA_64x8x64_F32E4M3E4M3_SS_TN<>;
 ```
 
-That oracle lives in `tmp_cute_fp8_k64.cu`.
+That oracle now lives in `docs/probes/src/oracle_cute_fp8_k64.cu`.
 
 ### Result
 
@@ -218,7 +218,7 @@ Humans naturally mix those up.
 
 We wrote official-layout probes using CuTe and CUTLASS to print raw metadata byte offsets.
 
-The probing pattern in `tmp_official_e_offsets.cpp` was basically:
+The probing pattern in `docs/probes/src/probe_official_fp8_metadata_layout.cpp` was basically:
 
 ```cpp
 auto fp8sE = make_tensor(make_smem_ptr(recast_ptr<Fp8E>(nullptr)), Fp8SmemE{});
@@ -241,7 +241,7 @@ For FP8 sparse `k64`, the logical raw metadata tensor looked like a simple row-m
 
 ### What we learned
 
-This killed the old hand-written FP8 metadata permutation formula. We changed the logical FP8 raw indexing to:
+This killed the old hand-written FP8 metadata permutation formula. We first changed the logical FP8 raw indexing to the obvious row-major form:
 
 ```cpp
 __device__ inline int smem_e_index_k64_e4m3(int row, int byte_col) {
@@ -249,7 +249,7 @@ __device__ inline int smem_e_index_k64_e4m3(int row, int byte_col) {
 }
 ```
 
-But that was still only half the story.
+But that was still only half the story. That formula describes logical coordinates, not the final physical shared-memory swizzle that Hopper actually consumes.
 
 ## Probe 6: Use easy patterns and hard patterns on purpose
 
@@ -261,9 +261,9 @@ Friendly tests are useful, but they lie. A kernel can pass a structured pattern 
 
 We built targeted probes:
 
-- `tmp_raw_fp8_onehot.cu`
-- `tmp_run_fp8_single_tile.cu`
-- `tmp_raw_fp8_meta_perm.cu`
+- `docs/probes/src/probe_raw_fp8_onehot_patterns.cu`
+- `docs/probes/src/probe_raw_fp8_single_tile_random.cu`
+- `docs/probes/src/probe_raw_fp8_metadata_permutations.cu`
 
 The onehot cases were intentionally simple: make B activate a narrow K slice so the expected output reveals where each sparse pair is landing.
 
@@ -371,7 +371,7 @@ So for FP8 sparse WGMMA, these are different questions:
 
 The logical answer was row-major.
 
-The physical answer still required the official sparse shared-memory layout machinery.
+The physical answer still required a swizzled placement. Earlier in the project we relied on CuTe to get that right. In the final version we derived that swizzle manually and encoded it directly in raw CUDA.
 
 ## The final fix
 
@@ -381,59 +381,56 @@ The fix that finally made FP8 pass combined three things.
 
 Already described above. Without this, mixed 2:4 patterns are wrong.
 
-### 2. Allocate FP8 metadata shared memory using the real sparse layout size
+### 2. Derive the real physical shared-memory swizzle for FP8 metadata
 
-For FP8, the shared-memory metadata storage is not just `64 * 8 = 512` bytes in the way we were thinking about it.
+For FP8, the important part was not a bigger abstraction. It was the exact byte address each logical metadata coordinate must land on.
 
-The code now uses the official sparse layout cosize:
-
-```cpp
-using RawFp8MetadataSmemLayoutE = decltype(cute::tile_to_shape(
-    RawFp8MetadataSmemLayoutAtomE{},
-    cute::Shape<cute::_64, cute::_64>{}));
-
-constexpr int kRawFp8MetadataSmemBytes = cute::cosize_v<RawFp8MetadataSmemLayoutE>;
-```
-
-And the FP8 shared-storage size is wired through:
+The final raw CUDA mapping in `wgmma_sp_raw_common.hpp` is:
 
 ```cpp
-static constexpr int kESmemBytes = kRawFp8MetadataSmemBytes;
-```
-
-### 3. Store metadata through the official logical tensor view, then derive the per-thread `u32` fragment from that layout
-
-This was the decisive part.
-
-Instead of writing FP8 metadata as a plain byte array, the kernel now does:
-
-```cpp
-auto sE = raw_fp8_smem_e_tensor(shared.smem_E);
-auto sEraw = cute::recast<uint8_t>(sE);
-
-for (int idx = tid; idx < kRawBlockM * kMetaBytes; idx += kRawThreads) {
-  int row = idx / kMetaBytes;
-  int byte_col = idx % kMetaBytes;
-  sEraw(row, byte_col) = e_bytes[(block_row + row) * (k / 8) + (k_tile / 8) + byte_col];
-}
-
-uint32_t e = raw_metadata_u32<BlockN, Element>(e_bytes, shared.smem_E, block_row, k_tile, k, tid);
-```
-
-And that metadata register is built by the per-shape helper:
-
-```cpp
-template <int BlockN>
-__device__ inline uint32_t raw_fp8_metadata_u32(uint8_t* smem_e, int tid) {
-  using MmaOp = typename RawFp8MetadataMmaOp<BlockN>::type;
-  using TiledMma = decltype(cute::make_tiled_mma(MmaOp{}));
-  ...
-  auto rE = cute::recast<uint32_t>(tCrE);
-  return rE[0];
+__device__ inline int smem_e_index_k64_e4m3(int row, int byte_col) {
+  int row_block = row >> 4;
+  int row_in_block = row & 15;
+  int row_lo = row_in_block & 7;
+  int row_hi = row_in_block >> 3;
+  int col_group = byte_col >> 2;
+  int col_lo = byte_col & 3;
+  return row_block * 128 + col_group * 64 + row_lo * 8 + row_hi * 4 + col_lo;
 }
 ```
 
-This exactly matched the working CuTe behavior closely enough to fix the kernel.
+So the logical `64 x 8` byte matrix is still the right mental model at the algorithm level, but the physical shared-memory placement is explicitly swizzled.
+
+### 3. Derive the per-thread `u32` metadata fragment manually
+
+Once the physical byte placement was correct, we still needed each thread to read the same 32-bit metadata fragment that the working reference path would have produced.
+
+The final raw CUDA thread mapping is:
+
+```cpp
+__device__ inline int e_thread_byte_offset_k64_e4m3(int tid) {
+  int row = ((tid >> 2) & 7) + ((tid & 1) << 3) + ((tid >> 5) << 4);
+  int byte_col = ((tid >> 1) & 1) << 2;
+  return smem_e_index_k64_e4m3(row, byte_col);
+}
+```
+
+And the actual metadata register load is now just a manual shared-memory load:
+
+```cpp
+template <int BlockN, typename Element>
+__device__ inline uint32_t raw_metadata_u32(
+    uint8_t const* e_bytes,
+    uint8_t* smem_e,
+    int block_row,
+    int k_tile,
+    int k,
+    int tid) {
+  return ld_shared_u32(smem_e + raw_e_thread_byte_offset<Element>(tid));
+}
+```
+
+This matched the working CuTe behavior closely enough to fix the kernel, and then let us remove the remaining CuTe dependency from the production FP8 path.
 
 ## Why the final fix makes sense in hindsight
 
@@ -452,10 +449,10 @@ After the final fix, these probes and demos passed.
 
 ### Focused probes
 
-- `tmp_raw_fp8_onehot`
+- `probe_raw_fp8_onehot_patterns`
   - all onehot cases passed
   - all alternating-pattern onehot cases passed
-- `tmp_run_fp8_single_tile`
+- `probe_raw_fp8_single_tile_random`
   - `random_64x8x64` passed
   - `random_64x8x128` passed
 
@@ -485,10 +482,11 @@ This is the real sequence of ideas and results, not a cleaned-up fairy tale.
 9. Inspected the legacy CUTLASS compressor and discovered the legal 8-bit metadata nibble codes.
 10. Implemented the FP8-specific nibble encoding in the host compressor.
 11. Re-ran probes and still saw failures, which meant encoding alone was not the whole story.
-12. Returned to the CuTe oracle and realized the real missing piece: FP8 metadata must still be stored through the official sparse shared-memory tensor, not a flat byte buffer.
-13. Changed FP8 `smem_E` sizing and writes to use the CuTe sparse metadata layout and per-thread fragment construction.
-14. Re-ran the onehot, alternating, single-tile random, and all final FP8 demo kernels on H800.
-15. Everything passed.
+12. Returned to the CuTe oracle and realized the real missing piece: FP8 metadata needed the correct physical sparse shared-memory placement, not just the correct logical row-major coordinates.
+13. Derived the FP8 metadata swizzle and per-thread metadata register mapping manually, then rewrote the production path to use explicit index formulas plus `ld.shared.u32`.
+14. Archived the probe and reverse-engineering files under `docs/probes/src/` so the repo root stayed clean without losing the engineering trail.
+15. Re-ran the onehot, alternating, single-tile random, and all final FP8 demo kernels on H800.
+16. Everything passed.
 
 That is the real shape of low-level debugging: not one clever jump, but a sequence of small eliminations until the remaining explanation is finally precise enough.
 
@@ -522,42 +520,21 @@ The alternating 2:4 pair pattern was much more informative than a friendly patte
 
 ## Design note: is the current FP8 `_cuda_` path fully manual and pure CUDA?
 
-Not yet.
+Yes.
 
-The current FP8 raw CUDA path is functionally correct, and the actual WGMMA instruction is still emitted through explicit inline PTX. But from a design-purity point of view, the FP8 metadata path still leans on CuTe.
+The production FP8 path in `wgmma_sp_raw_common.hpp` now matches the same design style as the F16/BF16 raw CUDA path:
 
-Today the FP8 path still uses CuTe for:
-
-- the sparse metadata shared-memory layout type
-- the per-thread metadata partitioning logic
-- the copy that forms each thread's `u32` metadata fragment
-
-By contrast, the F16/BF16 raw CUDA path is closer to a fully manual design:
-
-- manual shared-memory index formulas
-- manual metadata byte addressing
+- manual shared-memory index formulas for A, B, and E
+- manual FP8 metadata nibble encoding
+- manual per-thread metadata byte offset derivation
 - manual `ld.shared.u32`
-- raw PTX WGMMA call
+- raw PTX `wgmma.mma_async.sp` entrypoints
 
-So the honest answer is:
+CuTe is still valuable in this repo, but now only as a reference and debugging oracle. The probe archive under `docs/probes/src/` is the record of how the final manual FP8 mapping was derived.
 
-- the FP8 kernel is correct and raw at the instruction level
-- but it is not yet as purely manual as the F16 path
+That leaves the repo in the state we wanted from the start:
 
-## The next engineering step
-
-If the design goal is that the FP8 `_cuda_` kernels should have exactly the same style as F16, then the next step is clear:
-
-- replace the current CuTe-backed FP8 metadata helper path with explicit pure-CUDA logic
-- derive the exact FP8 metadata shared-memory swizzle and per-thread `u32` fragment mapping manually
-- keep the current verified behavior as the reference
-- preserve the same raw PTX instruction specializations that are already passing
-
-In other words, the next refactor is not about correctness anymore. It is about design cleanup:
-
-- same answers
-- same hardware behavior
-- less CuTe in the FP8 raw path
-- a more uniform "pure CUDA" story across F16, BF16, and FP8
-
-That is the right next step now that the kernel is finally correct.
+- raw CUDA is the real implementation
+- Hopper's real sparse FP8 `k64` shapes are covered
+- the kernels are verified on H800
+- the reverse-engineering trail is preserved without cluttering the repo root
